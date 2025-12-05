@@ -71,10 +71,17 @@ Occurred At: {occurred_at}
     # ---------------------------------------------------------
     # 🔥 RENAMED FROM `search()` TO `retrieve_memory()`
     # ---------------------------------------------------------
-    def retrieve_memory(self, query):
-        results = self.db.similarity_search(query, k=10)
-        return [r.metadata for r in results]
-
+    def retrieve(self, query,threshold=0.5):
+        # results = self.db.similarity_search(query, k=3)
+        # return [r.metadata for r in results]
+        results = self.db.similarity_search_with_relevance_scores(query, k=3)
+        if not results:
+            return None
+        doc,score=results[0]
+        if score<threshold:
+            return None
+        return [doc.metadata for doc, _ in results]
+    
     def list_all(self):
         data = self.db._collection.get()
         return data["metadatas"]
@@ -136,7 +143,7 @@ def add_or_update_memory(event_type: str = None,
 def retrieve_memory(query: str) -> list:
     """Retrieve episodic memories based on similarity search."""
     # 🔥 UPDATED: now calls memory.retrieve_memory()
-    results = memory.retrieve_memory(query)
+    results = memory.retrieve(query)
     return [format_event(r) for r in results]
 
 
@@ -181,7 +188,7 @@ Respond ONLY with the correct tool call.
 # ---------------------------------------------------------
 # LLM SETUP
 # ---------------------------------------------------------
-os.environ["GOOGLE_API_KEY"] = "AIzaSyBdAni72s8pWLVcA_bBzH-uIa5aOleYxjY"
+os.environ["GOOGLE_API_KEY"] = "AIzaSyATzlFrSuYuhids80R0-7z0JRdqCD4DZcU"
 
 llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash",
@@ -214,8 +221,3 @@ def run_agent(text: str):
 # ---------------------------------------------------------
 # TEST CALLS
 # ---------------------------------------------------------
-if __name__ == "__main__":
-    print(run_agent("I met Arjun today and we ate biryani."))
-    print(run_agent("Retrieve memories about Arjun"))
-    print(run_agent("What happened today?"))
-    print(run_agent("Show all memories"))
