@@ -1,7 +1,7 @@
 import os
 import time
 import json
-from dotenv import load_dotenv
+from dotenv import load_dotenv #type: ignore
 load_dotenv()
 
 from langchain.schema import HumanMessage, SystemMessage  # type: ignore
@@ -23,21 +23,15 @@ chat = ChatGoogleGenerativeAI(model=DEFAULT_GEMINI)
 class CoreMemoryManager:
     """
     CoreMemoryManager stores two canonical high-priority documents:
-      - type == "persona" -> agent/user tone, behavior, identity (one paragraph)
+      - type == "persona" -> stable identity, tone, behavior (one paragraph)
       - type == "human"   -> enduring facts/preferences (bullet points or short sentences)
-
-    add_memory(content, mtype="fact") appends facts (type "fact").
-    When total capacity exceeds MAX_BLOCKS * REWRITE_THRESHOLD, the manager:
-      - collects all docs,
-      - asks the model to compress them into JSON: {"persona": "...", "human": "..."},
-      - replaces all docs with exactly two documents (persona + human) with updated_at timestamp.
     """
 
     def __init__(self, vectordb=_vdb, chat_model=chat):
         self.vdb = vectordb
         self.chat = chat_model
 
-    def add_memory(self, content: str, mtype: str = "fact"):
+    def add_or_update(self, content: str, mtype: str = "fact"):
         """
         Add a memory document. mtype usually in {"fact","persona","human"}.
         After add, attempt rewrite if needed.
@@ -49,10 +43,14 @@ class CoreMemoryManager:
         doc = make_doc(content, meta)
         self.vdb.add_documents([doc])
 
+        try:
+            self.vdb.persist()
+        except Exception:
+            pass
         # check whether we need to compact the memories
         self.rewrite_if_needed()
 
-    def query_memory(self, query: str, k: int = 5):
+    def retrieve(self, query: str, k: int = 5, thresold: float =0.5):
         """
         Query memories using vector similarity. Returns list[Document].
         """
@@ -60,13 +58,21 @@ class CoreMemoryManager:
         if total == 0:
             return []
         k = min(k, total)
-        return self.vdb.similarity_search(query, k=k)
-
+        results = self.vdb.similarity_search_with_relevance_scores(query, k=k)
+        if not results:
+            return None
+        doc,score = results[0]
+        if score < thresold:
+            return None
+        return doc.page_content
+    
     def count(self) -> int:
         """
         Count number of stored docs.
         """
         coll = self.vdb._collection.get(include=["metadatas"])
+        c = len(coll["metadatas"])
+        print(f"[DEBUG] CoreMemoryManager.count()->{c}")
         return len(coll["metadatas"])
 
     def _collect_user_docs(self, k: int = 200):
@@ -80,9 +86,6 @@ class CoreMemoryManager:
         If stored docs exceed the threshold, compress them into two canonical blocks:
           - persona: one paragraph describing stable identity / tone
           - human: bullet-list or short sentences of enduring facts/preferences
-
-        The model is instructed to return ONLY valid JSON: {"persona": "...", "human": "..."}.
-        We parse that JSON defensively and replace all docs with the two canonical docs.
         """
         total = self.count()
         threshold = MAX_BLOCKS * REWRITE_THRESHOLD
@@ -147,10 +150,9 @@ class CoreMemoryManager:
 
         # replace docs with canonical persona & human docs
         try:
-            # empty filter → delete all docs (backend-dependent; wrapped in try)
+            # empty filter → delete all docs
             self.vdb.delete(filter={})
         except Exception:
-            # deletion might fail on some backends; continue to add new docs
             pass
 
         now = int(time.time())
