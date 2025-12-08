@@ -51,12 +51,9 @@ class SummaryAgent:
                 (
                     "system",
                     (
-                        "You are a concise, careful legal assistant. Use ONLY the VERIFIED SOURCES provided "
-                        "to answer the question. Do not invent facts. Speak in the voice of the system (e.g., 'We found...')."
-                        " Do NOT repeat the entire VERIFIED SOURCES block in your answer. Instead, use the sources for grounding."
-                        " At the very end include a short 'Sources used:' list showing only the sources you actually relied on, "
-                        "referenced by the source numbers from the VERIFIED SOURCES block below (for example: 'Sources used: [1], [3]')."
-                        " Output plain text only (no JSON). Keep the answer concise (2-5 short paragraphs)."
+                        "You are a concise, careful legal assistant. Use ONLY the VERIFIED SOURCES provided to answer the question. "
+                        "Do not invent facts. Speak in the voice of the system (e.g., 'We found...'). "
+                        "You MUST follow the judge flag 'is_sufficient' (passed separately). Do NOT re-evaluate or overrule it."
                     ),
                 ),
                 (
@@ -64,17 +61,22 @@ class SummaryAgent:
                     (
                         "QUESTION:\n{question}\n\n"
                         "VERIFIED SOURCES (numbered):\n{sources_block}\n\n"
-                        "Task: Provide a concise user-facing answer to the QUESTION grounded ONLY in the VERIFIED SOURCES. "
-                        "If the provided sources do not contain sufficient relevant information, respond briefly with: "
-                        "'We could not find sufficient relevant information in the available sources to answer that question.'"
-                        " Then stop. Otherwise, answer using only evidence from the sources. At the end, include a single line:"
-                        "'Sources used: [n], [m]' where n/m are the numbers of the sources you actually relied on."
+                        "JUDGE FLAG: is_sufficient = {is_sufficient}\n\n"
+                        "Instructions:\n"
+                        "- If is_sufficient is true: answer the QUESTION using ONLY the VERIFIED SOURCES. Do not hallucinate. "
+                        "Provide an evidence-backed answer to the query. Make sure to cover everything that is important from the given sources.\n\n"
+                        "- If is_sufficient is false: do NOT attempt to answer the question. Instead reply exactly and briefly:\n"
+                        "'Sufficient relevant information in the available sources to answer the question could not be found.'\n\n"
+                        
                     ),
                 ),
             ]
         )
 
-    def summarize_from_judge(self, judge_output: Dict[str, Any], question: str, max_sources: int = 8) -> str:
+
+    def summarize_from_judge(self, judge_output: Dict[str, Any], question: str = None, max_sources: int = 8) -> str:
+        if question is None : 
+            question = judge_output.get("results")[0][0].get("query") 
         raw_results = judge_output.get("results", [])
         flat = _flatten_results(raw_results)
         normalized = [_normalize_source(r, i + 1) for i, r in enumerate(flat)]
@@ -98,7 +100,7 @@ class SummaryAgent:
         sources_block = "\n".join(lines)
 
 
-        messages = self.prompt.format_messages(question=question, sources_block=sources_block)
+        messages = self.prompt.format_messages(question=question, sources_block=sources_block, is_sufficient = judge_output.get("is_sufficient"))
         resp = self.llm.invoke(messages)
         answer = resp.content.strip()
 
