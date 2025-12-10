@@ -136,14 +136,13 @@ class JudgeAgent:
 
 
 class EvaluateAgent:
-    def __init__(self):
+    def __init__(self, query):
         # use consistent model name / casing
         self.llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
         self.memory = Judge_Memory()
         self.judge_agent = JudgeAgent(llm=self.llm, memory=self.memory)
 
         # Get initial query and run all backends
-        query = input("Enter your query: ")
         self.results = run_all(query)
 
         # Convert JSON → objects
@@ -157,6 +156,8 @@ class EvaluateAgent:
             if hasattr(r, "query") and r.query:
                 return r.query
         return None
+
+        
 
     def run(self):
         context = ""
