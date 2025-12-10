@@ -1,8 +1,7 @@
 import os
 import time
 import json
-from dotenv import load_dotenv #type: ignore
-load_dotenv()
+from dotenv import load_dotenv  # type: ignore
 
 from langchain.schema import HumanMessage, SystemMessage  # type: ignore
 from langchain_google_genai import ChatGoogleGenerativeAI  # type: ignore
@@ -12,13 +11,6 @@ from vectorstore import init_vectorstore, make_doc  # type: ignore
 MAX_BLOCKS = int(os.getenv("MAX_BLOCKS", 300))
 REWRITE_THRESHOLD = float(os.getenv("REWRITE_THRESHOLD", 0.9))
 
-# initialize vectorstore and embedder
-_vdb, _embedder = init_vectorstore()
-
-# create chat model (ensure short model name, not "models/...")
-DEFAULT_GEMINI = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-chat = ChatGoogleGenerativeAI(model=DEFAULT_GEMINI)
-
 
 class CoreMemoryManager:
     """
@@ -27,15 +19,48 @@ class CoreMemoryManager:
       - type == "human"   -> enduring facts/preferences (bullet points or short sentences)
     """
 
-    def __init__(self, vectordb=_vdb, chat_model=chat):
-        self.vdb = vectordb
+    def __init__(self, vectordb=None, chat_model=None):
+        self._vdb = vectordb
+        self._embedder = None
+        self.vdb = vectordb  # public reference (may stay None until init)
         self.chat = chat_model
+        self._clients_initialized = False
+
+    def _init_clients(self):
+        if self._clients_initialized:
+            return
+        # ensure .env loaded (harmless if already loaded)
+        load_dotenv()
+
+        # init vectorstore if not provided
+        if self.vdb is None:
+            try:
+                _vdb, _embedder = init_vectorstore()
+                self.vdb = _vdb
+                self._embedder = _embedder
+            except Exception:
+                # if vectorstore cannot be initialized now, leave as None and let callers handle
+                self.vdb = None
+
+        # init chat model if not provided
+        if self.chat is None:
+            try:
+                DEFAULT_GEMINI = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+                self.chat = ChatGoogleGenerativeAI(model=DEFAULT_GEMINI)
+            except Exception:
+                self.chat = None
+
+        self._clients_initialized = True
 
     def add_or_update(self, content: str, mtype: str = "fact"):
         """
         Add a memory document. mtype usually in {"fact","persona","human"}.
         After add, attempt rewrite if needed.
         """
+        self._init_clients()
+        if self.vdb is None:
+            raise RuntimeError("Vectorstore not initialized")
+
         meta = {
             "type": mtype,
             "updated_at": int(time.time()),
@@ -50,10 +75,14 @@ class CoreMemoryManager:
         # check whether we need to compact the memories
         self.rewrite_if_needed()
 
-    def retrieve(self, query: str, k: int = 5, thresold: float =0.5):
+    def retrieve(self, query: str, k: int = 5, thresold: float = 0.5):
         """
         Query memories using vector similarity. Returns list[Document].
         """
+        self._init_clients()
+        if self.vdb is None:
+            return None
+
         total = self.count()
         if total == 0:
             return []
@@ -61,24 +90,30 @@ class CoreMemoryManager:
         results = self.vdb.similarity_search_with_relevance_scores(query, k=k)
         if not results:
             return None
-        doc,score = results[0]
+        doc, score = results[0]
         if score < thresold:
             return None
         return doc.page_content
-    
+
     def count(self) -> int:
         """
         Count number of stored docs.
         """
+        self._init_clients()
+        if self.vdb is None:
+            return 0
         coll = self.vdb._collection.get(include=["metadatas"])
         c = len(coll["metadatas"])
-        print(f"[DEBUG] CoreMemoryManager.count()->{c}")
+        # print(f"[DEBUG] CoreMemoryManager.count()->{c}")
         return len(coll["metadatas"])
 
     def _collect_user_docs(self, k: int = 200):
         """
         Collect up to k docs (used for rewrite). Returns list[Document].
         """
+        self._init_clients()
+        if self.vdb is None:
+            return []
         return self.vdb.similarity_search("", k=k)
 
     def rewrite_if_needed(self):
@@ -87,6 +122,10 @@ class CoreMemoryManager:
           - persona: one paragraph describing stable identity / tone
           - human: bullet-list or short sentences of enduring facts/preferences
         """
+        self._init_clients()
+        if self.vdb is None:
+            return
+
         total = self.count()
         threshold = MAX_BLOCKS * REWRITE_THRESHOLD
         if total < threshold:
@@ -112,6 +151,8 @@ class CoreMemoryManager:
         # get model output
         raw_resp = ""
         try:
+            if not self.chat:
+                return
             raw_resp = self.chat([system, human]).content
         except Exception:
             # if generation fails, bail out (leave existing docs intact)
