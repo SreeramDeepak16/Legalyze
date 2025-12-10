@@ -4,20 +4,23 @@ import os
 
 from langchain.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import Chroma
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_chroma import Chroma
 from langchain.agents import create_agent
+
+from dotenv import load_dotenv
+load_dotenv()
 
 
 # ---------------------------------------------------------
 # CHROMA SETUP
 # ---------------------------------------------------------
-EMBED = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+EMBED = GoogleGenerativeAIEmbeddings(model='models/gemini-embedding-001',google_api_key=os.getenv("EPISODIC_KEY"))
 
 CHROMA = Chroma(
     collection_name="episodic_memory",
     embedding_function=EMBED,
-    persist_directory="episodic_chroma_store"
+    persist_directory="episodic_db"
 )
 
 
@@ -191,8 +194,8 @@ Respond ONLY with the correct tool call.
 os.environ["GOOGLE_API_KEY"] = "AIzaSyATzlFrSuYuhids80R0-7z0JRdqCD4DZcU"
 
 llm = ChatGoogleGenerativeAI(
-    model="gemini-1.5-flash",
-    temperature=0
+    model="gemini-2.5-flash",
+    google_api_key=os.getenv("EPISODIC_KEY")
 )
 
 

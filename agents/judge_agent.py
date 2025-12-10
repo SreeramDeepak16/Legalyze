@@ -2,8 +2,8 @@ from langchain_core.messages import HumanMessage  # type:ignore
 from typing import List  # type:ignore
 from pydantic import BaseModel  # type:ignore
 from langchain_google_genai import ChatGoogleGenerativeAI  # type:ignore
-from run_search_agent import run_all
-import json
+from agents.run_search_agent import run_all
+import os
 
 
 class Judge_Memory:
@@ -53,7 +53,7 @@ class JudgeResult(BaseModel):
 class JudgeAgent:
     def __init__(
         self,
-        llm=ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0),
+        llm=ChatGoogleGenerativeAI(model="gemini-2.5-pro", google_api_key=os.getenv("JUDGE_KEY")),
         memory=Judge_Memory(),
     ):
         self.llm = llm
@@ -136,14 +136,13 @@ class JudgeAgent:
 
 
 class EvaluateAgent:
-    def __init__(self):
+    def __init__(self, query):
         # use consistent model name / casing
-        self.llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+        self.llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=os.getenv("JUDGE_KEY"))
         self.memory = Judge_Memory()
         self.judge_agent = JudgeAgent(llm=self.llm, memory=self.memory)
 
         # Get initial query and run all backends
-        query = input("Enter your query: ")
         self.results = run_all(query)
 
         # Convert JSON → objects
@@ -170,7 +169,7 @@ class EvaluateAgent:
                 user_query=self.current_query,
                 search_results=self.sample_results,
                 conversation_history=context,
-                iteration=iteration,
+                iteration=iteration
             )
 
             print("Is Sufficient:", result.is_sufficient)
@@ -215,8 +214,7 @@ class EvaluateAgent:
             iteration += 1
 
         # Use the last result we have (final_result)
-        return json.dumps(
-            {
+        return {
                 "is_sufficient": final_result.is_sufficient,
                 "reasoning": final_result.reasoning,
                 "date_check": final_result.date_check,
@@ -224,4 +222,4 @@ class EvaluateAgent:
                 "contradiction": final_result.contradiction_check,
                 "results": self.results,
             }
-        )
+        

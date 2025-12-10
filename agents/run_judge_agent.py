@@ -1,4 +1,4 @@
-from judgeAgent import EvaluateAgent
+from judge_agent import EvaluateAgent
 from summary_agent import SummaryAgent
 
 

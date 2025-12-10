@@ -4,6 +4,7 @@ from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.prompts import PromptTemplate
 from langchain_core.documents import Document
 from pydantic import BaseModel
+import os
 from dotenv import load_dotenv
 load_dotenv()
 # semantic memory is being stored in databse like the below structure
@@ -19,12 +20,13 @@ class SemanticMemoryManager:
     def __init__(self, db_path="./semanticdb"):
 
         self.llm = GoogleGenerativeAI(
-            model="models/gemini-1.5-flash",
-            response_mime_type="application/json"
+            model="models/gemini-2.5-flash",
+            google_api_key=os.getenv("SEMANTIC_KEY")
         )
         # Embedding model
         self.embedding_model = GoogleGenerativeAIEmbeddings(
-            model="models/text-embedding-004"
+            model="models/text-embedding-004",
+            google_api_key=os.getenv("SEMANTIC_KEY")
         )
         # Vector database
         self.vectorstore = Chroma(

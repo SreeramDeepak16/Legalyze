@@ -9,7 +9,10 @@ from agents.semantic_memory_manager import SemanticMemoryManager
 from agents.procedural_memory_manager import ProceduralMemoryManager
 from agents.resource_memory_manager import ResourceMemoryManager
 from agents.knowledge_vault_manager import KnowledgeVaultManager
+import os
 
+from dotenv import load_dotenv
+load_dotenv()
 
 # --------------------------------------------------------------
 # Pydantic schema for LLM classification output
@@ -22,14 +25,14 @@ class MetaDecision(BaseModel):
 class MetaMemoryManager:
 
     def __init__(self):
-        self.llm = GoogleGenerativeAI(model="gemini-1.5-flash")
+        self.llm = GoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=os.getenv("MMM_KEY"))
         self.agents = {
             "core": CoreMemoryManager(),
             "episodic": EpisodicMemoryManager(),
             "semantic": SemanticMemoryManager(),
             "procedural": ProceduralMemoryManager(),
             "resource": ResourceMemoryManager(),
-            "knowledge_vault": KnowledgeVaultManager()
+            "knowledge": KnowledgeVaultManager()
             }
 
         self.parser = PydanticOutputParser(pydantic_object=MetaDecision)
@@ -198,5 +201,4 @@ USER INPUT:
                         self.agents[mem_type].add_or_update(input_text)
                 except Exception as e:
                     results["agent_results"]["update"][mem_type] = {"error": str(e)}
-        print(results)
         return results

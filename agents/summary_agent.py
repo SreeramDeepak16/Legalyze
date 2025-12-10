@@ -5,6 +5,9 @@ from urllib.parse import urlparse
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.language_models import BaseChatModel
 from langchain_google_genai import ChatGoogleGenerativeAI
+import os
+from dotenv import load_dotenv
+load_dotenv()
 
 
 def _flatten_results(results_field: Any) -> List[Dict[str, Any]]:
@@ -44,7 +47,7 @@ class SummaryAgent:
     """
 
     def __init__(self, llm: Optional[BaseChatModel] = None) -> None:
-        self.llm = llm or ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+        self.llm = llm or ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=os.getenv("SUMMARY_KEY"))
 
         self.prompt = ChatPromptTemplate.from_messages(
             [

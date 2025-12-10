@@ -12,6 +12,9 @@ from langchain_google_genai import (
     ChatGoogleGenerativeAI,
 )
 
+from dotenv import load_dotenv
+load_dotenv()
+
 
 class ResourceMemoryManager:
     """
@@ -27,7 +30,8 @@ class ResourceMemoryManager:
 
         # Gemini embeddings
         self.embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/text-embedding-004"
+            model="models/text-embedding-004",
+            google_api_key=os.getenv("RESOURCE_KEY")
         )
 
         # Vector DB (Chroma)
@@ -40,8 +44,8 @@ class ResourceMemoryManager:
         # LLM for summarization
         self.auto_summarize = auto_summarize
         self.llm = ChatGoogleGenerativeAI(
-            model="gemini-1.5-flash",
-            temperature=0,
+            model="gemini-2.5-flash",
+            google_api_key=os.getenv("RESOURCE_KEY")
         ) if auto_summarize else None
 
         # Chunking config

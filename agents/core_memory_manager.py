@@ -1,12 +1,13 @@
 import os
 import time
 import json
-from dotenv import load_dotenv #type: ignore
-load_dotenv()
 
 from langchain_core.messages import HumanMessage, SystemMessage  # type: ignore
 from langchain_google_genai import ChatGoogleGenerativeAI  # type: ignore
 from agents.vectorstore import init_vectorstore, make_doc  # type: ignore
+
+from dotenv import load_dotenv
+load_dotenv()
 
 # configuration (can be set in .env)
 MAX_BLOCKS = int(os.getenv("MAX_BLOCKS", 300))
@@ -16,8 +17,7 @@ REWRITE_THRESHOLD = float(os.getenv("REWRITE_THRESHOLD", 0.9))
 _vdb, _embedder = init_vectorstore()
 
 # create chat model (ensure short model name, not "models/...")
-DEFAULT_GEMINI = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-chat = ChatGoogleGenerativeAI(model=DEFAULT_GEMINI)
+chat = ChatGoogleGenerativeAI(model="gemini-2.5-flash",google_api_key=os.getenv("CORE_KEY"))
 
 
 class CoreMemoryManager():

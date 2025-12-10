@@ -5,6 +5,8 @@ from langchain_chroma import Chroma
 from pydantic import BaseModel, Field
 from typing import Literal
 import uuid
+import os
+
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -25,8 +27,8 @@ class knowledgeVaultSchema(BaseModel):
 
 class KnowledgeVaultManager():
     def __init__(self):
-        self.llm = ChatGoogleGenerativeAI(model='gemini-1.5-flash')
-        self.llm_embed = GoogleGenerativeAIEmbeddings(model='models/gemini-embedding-001')
+        self.llm = ChatGoogleGenerativeAI(model='gemini-2.5-flash',google_api_key=os.getenv("KNOWLEDGE_KEY"))
+        self.llm_embed = GoogleGenerativeAIEmbeddings(model='models/gemini-embedding-001',google_api_key=os.getenv("KNOWLEDGE_KEY"))
         self.db = Chroma(collection_name='knowledge_memory',
                     persist_directory="knowledge_db",
                     embedding_function=self.llm_embed)

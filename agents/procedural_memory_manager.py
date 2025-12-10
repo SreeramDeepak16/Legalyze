@@ -1,12 +1,13 @@
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from dotenv import load_dotenv
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from pydantic import BaseModel, Field
 from langchain_chroma import Chroma
 from typing import List
 import uuid
+import os
 
+from dotenv import load_dotenv
 load_dotenv()
 
 # {
@@ -42,8 +43,8 @@ class proceduralSchema(BaseModel):
 
 class ProceduralMemoryManager():
     def __init__(self):
-        self.llm = ChatGoogleGenerativeAI(model='gemini-1.5-flash')
-        self.llm_embed = GoogleGenerativeAIEmbeddings(model='models/gemini-embedding-001')
+        self.llm = ChatGoogleGenerativeAI(model='gemini-2.5-flash',google_api_key=os.getenv("PROCEDURAL_KEY"))
+        self.llm_embed = GoogleGenerativeAIEmbeddings(model='models/gemini-embedding-001',google_api_key=os.getenv("PROCEDURAL_KEY"))
         self.db = Chroma(collection_name='procedural_memory',
                     persist_directory="procedural_db",
                     embedding_function=self.llm_embed)

@@ -4,7 +4,7 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
 from pydantic import BaseModel, Field
 from typing import Literal
-
+import os
 load_dotenv()
 
 
@@ -20,7 +20,7 @@ class GeneratedQuery(BaseModel):
 
 class QueryAgent():
     def __init__(self):
-        self.llm = ChatGoogleGenerativeAI(model='gemini-2.5-flash')
+        self.llm = ChatGoogleGenerativeAI(model='gemini-2.5-flash',google_api_key=os.getenv("QUERY_KEY"))
 
     def analyze_query(self, input_query : str) :
         parser = PydanticOutputParser(pydantic_object=Feedback)
@@ -56,15 +56,16 @@ class QueryAgent():
         return result.new_query
     
     def get_complete_query(self, query : str):
-        while (self.analyze_query(query) == 'Not Enough') :
+        sufficiency = self.analyze_query(query)
+        if (sufficiency == 'Not Enough'):
             ques_list = self.generate_follow_up_questions(query)
-            ans_list = []
-            for ques in ques_list :
-                ans = input(ques)
-                ans_list.append(ans)
-            query = self.generate_new_query(query,ques_list,ans_list)
-        return query
-
+            return {"sufficiency" : sufficiency, "follow_up_questions":ques_list}
+        return {"sufficiency" : sufficiency}
+            # ans_list = []
+            # for ques in ques_list :
+            #     ans = input(ques)
+            #     ans_list.append(ans)
+            # query = self.generate_new_query(query,ques_list,ans_list)
 
 
 

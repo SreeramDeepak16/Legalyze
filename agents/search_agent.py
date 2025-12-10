@@ -10,8 +10,7 @@ from typing import List, Dict, Any, Optional
 import requests
 from bs4 import BeautifulSoup
 
-from mirix_interface import MirixMemoryClientProtocol, MirixMemoryStub
-from connectors import CourtListenerClient
+from agents.connectors import CourtListenerClient
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 # ---------- helpers ----------
@@ -86,14 +85,20 @@ def _norm_score(x, lo, hi):
 
 # ---------- SearchAgent ----------
 class SearchAgent:
-    def __init__(self, mirix_client: Optional[MirixMemoryClientProtocol] = None, gemini_model: str = "gemini-2.5-pro"):
-        self.mirix = mirix_client or MirixMemoryStub()
+    # def __init__(self, mirix_client: Optional[MirixMemoryClientProtocol] = None, gemini_model: str = "gemini-2.5-pro"):
+    #     self.mirix = mirix_client or MirixMemoryStub()
+    #     self.courtlistener = CourtListenerClient()
+    #     self.serpapi_key = os.getenv("SERPAPI_API_KEY")
+    #     self.llm = (
+    #         ChatGoogleGenerativeAI(model=gemini_model, google_api_key=os.getenv("SEARCH_KEY"))
+    #     )
+
+    def __init__(self, mirix_client = None, gemini_model: str = "gemini-2.5-pro"):
+        self.mirix = mirix_client 
         self.courtlistener = CourtListenerClient()
         self.serpapi_key = os.getenv("SERPAPI_API_KEY")
         self.llm = (
-            ChatGoogleGenerativeAI(model=gemini_model, temperature=0)
-            if os.getenv("GOOGLE_API_KEY")
-            else None
+            ChatGoogleGenerativeAI(model=gemini_model, google_api_key=os.getenv("SEARCH_KEY"))
         )
 
     # ----- Mirix (assumed to return content/snippet) -----
@@ -256,3 +261,4 @@ class SearchAgent:
 
         # if we reach here: no usable hits
         return []
+    
