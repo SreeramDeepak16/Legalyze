@@ -1,151 +1,163 @@
-# search_agent/agent.py
-from dotenv import load_dotenv
+from urllib.parse import urlparse
+from bs4 import BeautifulSoup #type:ignore
+from dotenv import load_dotenv #type:ignore
 load_dotenv()
 
 import os
 import re
 import time
 from typing import List, Dict, Any, Optional
+import math
 
-import requests
-from bs4 import BeautifulSoup
-
-from mirix_interface import MirixMemoryClientProtocol, MirixMemoryStub
-from connectors import CourtListenerClient
-from langchain_google_genai import ChatGoogleGenerativeAI
+import requests #type:ignore
+ 
+from agents.connectors import CourtListenerClient 
+from langchain_google_genai import ChatGoogleGenerativeAI #type:ignore
+from agents.meta_memory_manager import MetaMemoryManager
 
 # ---------- helpers ----------
-def _norm_score(x, lo, hi):
-    if hi - lo == 0:
-        return 0.0
-    return max(0.0, min(1.0, (x - lo) / (hi - lo)))
 
-# def choose_best_paragraph(content: str, query: str, title: Optional[str] = None, max_paras: int = 600) -> str:
-#     """
-#     Given full text `content` and `query`, return the most relevant paragraph.
-#     Heuristics: paragraph length, query-term matches, presence of legal signpost words,
-#     penalize headings/short captions.
-#     """
-#     if not content:
-#         return ""
+from typing import List, Dict, Any, Optional
 
-#     q_tokens = [t.lower() for t in re.split(r"\W+", query) if len(t) > 2][:12]
-#     signpost = ["held", "holding", "held that", "therefore", "conclude", "concluded",
-#                 "accordingly", "judgment", "opinion", "reason", "reasoning", "analysis",
-#                 "dissent", "majority", "court finds", "liable", "reversed", "affirmed", "remanded"]
+def pick_best_case(
+    results: List[Dict[str, Any]],
+    prefer_court_substr: str = "Supreme",
+    prefer_cite_substr: str = "U.S.",
+    prefer_name_substr: str = "Topeka",
+) -> Optional[Dict[str, Any]]:
+    """
+    Score and pick the best case from CourtListener results.
 
-#     paras = [p.strip() for p in re.split(r'\n{2,}', content) if p.strip()]
-#     if not paras:
-#         paras = [s.strip() for s in re.split(r'(?<=[.!?])\s+', content) if s.strip()]
+    Scoring heuristics:
+      +3 if `court` contains prefer_court_substr (e.g., "Supreme")
+      +2 if any citation contains prefer_cite_substr (e.g., "U.S.")
+      +1 if case name contains prefer_name_substr (e.g., "Topeka")
+      small preference for earlier results
 
-#     best_para = ""
-#     best_score = -999.0
+    Returns the best result dict or None if no results.
+    """
+    if not results:
+        return None
 
-#     for idx, para in enumerate(paras[:max_paras]):
-#         low = para.lower()
-#         if len(low) < 60:
-#             continue
-#         letters = "".join(ch for ch in para if ch.isalpha())
-#         if len(letters) >= 6:
-#             upp = sum(1 for ch in letters if ch.isupper())
-#             if upp / max(1, len(letters)) > 0.75:
-#                 continue
+    def _field_text(val):
+        if val is None:
+            return ""
+        if isinstance(val, list):
+            return " ".join(str(x) for x in val).lower()
+        return str(val).lower()
 
-#         score = min(len(low) / 500.0, 2.0)
-#         for t in q_tokens:
-#             if t in low:
-#                 score += 1.2
-#         for s in signpost:
-#             if s in low:
-#                 score += 2.0
-#         if title:
-#             tlow = title.lower()
-#             if tlow and tlow in low:
-#                 score += 2.5
-#         if idx <= 2:
-#             score -= 0.45
-#         if idx > 1:
-#             score += 0.1
-#         if " v. " in low or " u.s. " in low or "§" in para or "sec." in low:
-#             score += 0.5
+    best = None
+    best_score = float("-inf")
+    for idx, r in enumerate(results):
+        score = 0.0
+        court = _field_text(r.get("court") or r.get("case_court") or r.get("source_court"))
+        case_name = _field_text(r.get("case_name") or r.get("title") or "")
+        citation = _field_text(r.get("citation") or "")
 
-#         if score > best_score:
-#             best_score = score
-#             best_para = para
+        if prefer_court_substr.lower() in court:
+            score += 3.0
+        if prefer_cite_substr.lower() in citation:
+            score += 2.0
+        if prefer_name_substr.lower() in case_name:
+            score += 1.0
 
-#     if not best_para:
-#         for p in paras:
-#             if len(p) > 150:
-#                 best_para = p
-#                 break
-#     if not best_para:
-#         best_para = paras[0] if paras else content[:800]
+        # small boost for items earlier in the list
+        score += max(0.0, 1.0 - idx * 0.05)
 
-#     return best_para.strip()[:1600]
+        # a tiny penalty for empty content (if content available)
+        content_len = len(str(r.get("content") or ""))
+        if content_len < 300:
+            score -= 0.5
+
+        if score > best_score:
+            best_score = score
+            best = r
+
+    return best
 
 
 # ---------- SearchAgent ----------
 class SearchAgent:
-    def __init__(self, mirix_client: Optional[MirixMemoryClientProtocol] = None, gemini_model: str = "gemini-1.5-pro"):
-        self.mirix = mirix_client or MirixMemoryStub()
+    def __init__(self):
         self.courtlistener = CourtListenerClient()
         self.serpapi_key = os.getenv("SERPAPI_API_KEY")
-        self.llm = (
-            ChatGoogleGenerativeAI(model=gemini_model, temperature=0)
-            if os.getenv("GOOGLE_API_KEY")
-            else None
-        )
+        self.meta_manager = MetaMemoryManager()
 
+        
     # ----- Mirix (assumed to return content/snippet) -----
     def search_mirix_paragraph(self, q: str, top_k: int = 3) -> List[Dict[str, Any]]:
-        hits = self.mirix.search(q, top_k=top_k)
-        out: List[Dict[str, Any]] = []
-        for h in hits:
-            content = h.get("content") or h.get("snippet") or ""
-            title = h.get("source") or h.get("title") or None
-            # para = choose_best_paragraph(content, q, title)
-            out.append({
-                "query":q,
-                "backend": "mirix",
-                "id": h.get("id"),
-                "source": h.get("source"),
-                "title": h.get("title"),
-                "content": content,
-            })
+        results = self.meta_manager.dispatch(q)
+        agent_results = results["agent_results"]["retrieval"]
+        memories = list(agent_results.keys())
+        out:List[Dict[str,Any]] = []
+        for memory in memories:
+            if agent_results[memory]!=None:
+                out.append({
+                    "query":q,
+                    "backend": "mirix",
+                    "source": memory,
+                    "title": None,
+                    "content": agent_results[memory]})
+                
         return out
-
     # ----- CourtListener -----
-    def search_courtlistener_paragraph(self, q: str, top_k: int = 1) -> List[Dict[str, Any]]:
-        results = self.courtlistener.search(q, page_size=max(top_k, 10))
-        q_tokens = [t.lower() for t in re.split(r"\W+", q) if len(t) > 2]
-        def name_match(r):
-            cn = (r.get("case_name") or "").lower()
-            cit = (r.get("citation") or "").lower()
-            if any(tok in cn for tok in q_tokens if len(tok) > 3):
-                return True
-            if any(tok in cit for tok in q_tokens if len(tok) > 1):
-                return True
-            return False
+    def search_courtlistener_paragraph(self, q: str, top_k: int = 1, prefer_scotus: bool = True) -> List[Dict[str, Any]]:
+        """
+        Fetches up to `max_candidates` search results from CourtListener, picks the best one
+        (using pick_best_case) and returns JSON-shaped hits limited by top_k.
 
-        matching = [r for r in results if name_match(r)]
-        ordered = (matching + [r for r in results if r not in matching])[:top_k]
+        - prefer_scotus: when True, pick_best_case will prefer 'Supreme' court / 'U.S.' citations / 'Topeka' name.
+        """
+        max_candidates = max(top_k, 8)  # request several so we can rank
+        results = self.courtlistener.search_with_content(q, max_results=max_candidates)
+
+        if not results:
+            return []
+
+        # If prefer_scotus, bias the ranking toward SCOTUS/U.S. reports/Topeka
+        if prefer_scotus:
+            best = pick_best_case(results,
+                                  prefer_court_substr="Supreme",
+                                  prefer_cite_substr="U.S.",
+                                  prefer_name_substr="Topeka")
+        else:
+            best = pick_best_case(results,
+                                  prefer_court_substr="",  # weaker bias
+                                  prefer_cite_substr="",
+                                  prefer_name_substr="")
+
+        # If user asked for multiple hits (top_k > 1), produce ordered list:
+        ordered: List[Dict[str, Any]] = []
+        if top_k == 1:
+            chosen = best or results[0]
+            ordered = [chosen]
+        else:
+            # put best first, then the rest (unique)
+            seen_ids = set()
+            if best:
+                ordered.append(best); seen_ids.add(best.get("id"))
+            for r in results:
+                if r.get("id") in seen_ids:
+                    continue
+                ordered.append(r); seen_ids.add(r.get("id"))
+                if len(ordered) >= top_k:
+                    break
 
         out: List[Dict[str, Any]] = []
-        for r in ordered:
-            api_url = r.get("url")
-            full = self.courtlistener.fetch(api_url)
-            content = full.get("content", "") or ""
-            title = r.get("case_name")
-            # para = choose_best_paragraph(content, q, title)
+        for r in ordered[:top_k]:
             out.append({
-                "query":q, 
+                "query": q,
                 "backend": "courtlistener",
-                "source": api_url,
-                "title": title,
+                "id": r.get("id"),
+                "source": r.get("url"),
+                "title": r.get("case_name"),
                 "citation": r.get("citation"),
-                "content": content,
+                "content": r.get("content") or "",
+                "retrieved_at": r.get("retrieved_at"),
             })
         return out
+
+
 
     # ----- Web search (SerpAPI) -----
     def search_web_paragraph(self, q: str, top_k: int = 1, preferred_domain: Optional[str] = None) -> List[Dict[str, Any]]:
