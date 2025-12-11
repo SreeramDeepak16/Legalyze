@@ -1,4 +1,3 @@
-# search_agent/connectors.py
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -13,12 +12,20 @@ USER_AGENT = {"User-Agent": "mirix-search-agent/1.0 (+https://example.org)"}
 
 class CourtListenerClient:
     """
-    Minimal CourtListener v4 client with graceful fallback.
-    - Tries v4 API (requires COURTLISTENER_API_KEY in .env).
-    - If API fails (403/401/timeout/DNS/404), falls back to scraping the public search page.
-    - fetch() accepts either the public /opinion/... URL or the API URL and converts where possible.
+    CourtListener client that:
+    - Uses /api/rest/v4/search/ to find clusters with opinions.
+    - For each result, fetches the underlying opinion via /opinions/{id}/.
+    - Extracts plain text (or strips HTML as a fallback).
+    - On API failure/timeout, falls back to scraping the public search page.
+
+    High-level helper:
+        search_with_content(query, max_results)
+        -> list[ {id, url, case_name, citation, content, retrieved_at} ]
     """
-    BASE = "https://www.courtlistener.com/api/rest/v4/opinions/"
+
+    API_ROOT = "https://www.courtlistener.com/api/rest/v4"
+    SEARCH_URL = f"{API_ROOT}/search/"
+    OPINIONS_URL = f"{API_ROOT}/opinions/"
     KEY = os.getenv("COURTLISTENER_API_KEY")
 
     def _headers(self) -> Dict[str, str]:
@@ -30,115 +37,172 @@ class CourtListenerClient:
             headers["Authorization"] = f"Token {self.KEY}"
         return headers
 
-    def search(self, query: str, page_size: int = 1) -> List[Dict[str, Any]]:
-        # Try v4 API
-        try:
-            api_url = f"{self.BASE}?q={requests.utils.requote_uri(query)}&page_size={page_size}"
-            r = requests.get(api_url, headers=self._headers(), timeout=15)
-            if r.status_code == 200:
-                data = r.json()
-                items = []
-                for item in data.get("results", []):
-                    items.append({
-                        "id": item.get("id"),
-                        "url": item.get("absolute_url"),
-                        "case_name": item.get("case_name"),
-                        "citation": item.get("citation"),
-                    })
-                return items
-            else:
-                # Non-200: log & fallback
-                print(f"[CourtListener] API v4 returned {r.status_code}: {r.text[:300]}")
-        except Exception as e:
-            print("[CourtListener] v4 request failed; falling back to scraping. Error:", repr(e))
-
-        # Fallback: scrape public search page
-        try:
-            search_url = f"https://www.courtlistener.com/?q={requests.utils.requote_uri(query)}"
-            page = requests.get(search_url, headers=USER_AGENT, timeout=15)
-            page.raise_for_status()
-
-            soup = BeautifulSoup(page.text, "html.parser")
-            items = []
-            seen = set()
-            for a in soup.select("a[href*='/opinion/']"):
-                href = a.get("href")
-                if not href:
-                    continue
-                if not href.startswith("http"):
-                    href = "https://www.courtlistener.com" + href
-                if href in seen:
-                    continue
-                seen.add(href)
-                title = a.get_text(" ", strip=True)
-                items.append({
-                    "id": None,
-                    "url": href,
-                    "case_name": title,
-                    "citation": None
-                })
-                if len(items) >= page_size:
-                    break
-            return items
-        except Exception as e:
-            print("[CourtListener] Scraping fallback failed:", repr(e))
-            return []
-
-    def fetch(self, url: str) -> Dict[str, Any]:
+    # ---------- low-level opinion fetch ---------- #
+    def _fetch_opinion_by_id(self, opinion_id: int) -> Dict[str, Any]:
         """
-        Fetch opinion content.
-        Accepts either:
-        - a public URL like https://www.courtlistener.com/opinion/{id}/...
-        - an API URL like https://www.courtlistener.com/api/rest/v4/opinions/{id}/
-        Returns dict with 'content' (text), 'case_name', 'citation', 'source', 'retrieved_at'.
+        Fetch one opinion by ID from /opinions/{id}/ and return dict with:
+            { "case_name", "citation", "content", "retrieved_at" }
         """
-        # Convert public opinion URL to API if possible
+        url = f"{self.OPINIONS_URL}{opinion_id}/"
         try:
-            if "/opinion/" in url and "api/rest" not in url:
-                parts = url.rstrip("/").split("/")
-                opinion_id = next((p for p in parts if p.isdigit()), None)
-                if opinion_id:
-                    url = f"https://www.courtlistener.com/api/rest/v4/opinions/{opinion_id}/"
-        except Exception:
-            pass
-
-        # Try API fetch
-        try:
-            r = requests.get(url, headers=self._headers(), timeout=15)
+            # a bit more generous timeout here
+            r = requests.get(url, headers=self._headers(), timeout=25)
             r.raise_for_status()
             data = r.json()
-            text = data.get("plain_text") or data.get("html_with_citations") or ""
-            return {
-                "backend": "courtlistener",
-                "source": data.get("absolute_url") or url,
-                "case_name": data.get("case_name"),
-                "citation": data.get("citation"),
-                "content": text,
-                "retrieved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            }
         except Exception as e:
-            # API fetch failed — try HTML fetch
-            print("[CourtListener] API fetch failed; trying HTML fallback:", repr(e))
-
-        # HTML fallback
-        try:
-            page = requests.get(url, headers=USER_AGENT, timeout=15)
-            page.raise_for_status()
-            soup = BeautifulSoup(page.text, "html.parser")
-            paragraphs = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
-            text = "\n\n".join(paragraphs)
+            print("[CourtListener] _fetch_opinion_by_id API error:", repr(e))
             return {
-                "backend": "courtlistener",
-                "source": url,
                 "case_name": None,
                 "citation": None,
-                "content": text,
-                "retrieved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                "content": "",
+                "retrieved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             }
-        except Exception as e:
-            print("[CourtListener] HTML fallback also failed:", repr(e))
-            return {"backend": "courtlistener", "source": url, "content": "", "retrieved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 
+        # Prefer plain_text, but fall back to any HTML field.
+        text = (data.get("plain_text") or "").strip()
+        if not text:
+            html = (
+                data.get("html_with_citations")
+                or data.get("html")
+                or data.get("html_lawbox")
+                or data.get("html_columbia")
+                or ""
+            )
+            if html:
+                soup = BeautifulSoup(html, "html.parser")
+                text = soup.get_text("\n", strip=True)
+
+        return {
+            "case_name": data.get("case_name"),
+            "citation": data.get("citation"),
+            "content": text or "",
+            "retrieved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+
+    # ---------- fallback: scrape public search page ---------- #
+    def _fallback_scrape_search(self, query: str, max_results: int) -> List[Dict[str, Any]]:
+        """
+        Scrape https://www.courtlistener.com/?q=... for /opinion/ links,
+        extract opinion ID from URL, and then fetch via _fetch_opinion_by_id.
+        """
+        print("[CourtListener] Using HTML search fallback...")
+        search_url = f"https://www.courtlistener.com/?q={requests.utils.requote_uri(query)}"
+        items: List[Dict[str, Any]] = []
+
+        try:
+            page = requests.get(search_url, headers=USER_AGENT, timeout=25)
+            page.raise_for_status()
+        except Exception as e:
+            print("[CourtListener] Fallback search page request failed:", repr(e))
+            return items
+
+        soup = BeautifulSoup(page.text, "html.parser")
+        seen = set()
+
+        for a in soup.select("a[href*='/opinion/']"):
+            href = a.get("href")
+            if not href:
+                continue
+            if not href.startswith("http"):
+                href = "https://www.courtlistener.com" + href
+            if href in seen:
+                continue
+            seen.add(href)
+
+            # Extract numeric opinion id from URL
+            opinion_id: Optional[int] = None
+            try:
+                parts = href.rstrip("/").split("/")
+                for p in parts:
+                    if p.isdigit():
+                        opinion_id = int(p)
+                        break
+            except Exception:
+                opinion_id = None
+
+            if opinion_id is not None:
+                opinion = self._fetch_opinion_by_id(opinion_id)
+                case_name = opinion["case_name"] or a.get_text(" ", strip=True)
+                items.append({
+                    "id": opinion_id,
+                    "url": href,
+                    "case_name": case_name,
+                    "citation": opinion["citation"],
+                    "content": opinion["content"],
+                    "retrieved_at": opinion["retrieved_at"],
+                })
+            else:
+                # if we can't parse an id, we could still scrape raw HTML, but we'll skip for now
+                continue
+
+            if len(items) >= max_results:
+                break
+
+        return items
+
+    # ---------- high-level: search + full content ---------- #
+    def search_with_content(self, query: str, max_results: int = 1) -> List[Dict[str, Any]]:
+        """
+        1) Try /api/rest/v4/search/ with the query.
+        2) For each hit, grab the first opinion's ID and fetch via /opinions/{id}/.
+        3) On failure/timeout, fall back to scraping the HTML search page.
+
+        Returns list of dicts:
+           {
+             "id": opinion_id,
+             "url": "https://www.courtlistener.com/opinion/.../",
+             "case_name": "Brown v. Board of Education",
+             "citation": ["978 F.2d 585", ...] or None,
+             "content": "<plain text of opinion>",
+             "retrieved_at": "<iso8601>",
+           }
+        """
+        results: List[Dict[str, Any]] = []
+
+        # ---- primary: REST v4 search API ---- #
+        try:
+            params = {
+                "q": query,
+                "page_size": max_results,
+                "cluster__has_opinion": "true",
+            }
+            # longer timeout to reduce ReadTimeout issues
+            r = requests.get(self.SEARCH_URL, headers=self._headers(), params=params, timeout=25)
+            r.raise_for_status()
+            data = r.json()
+
+            for item in data.get("results", [])[:max_results]:
+                opinions = item.get("opinions") or []
+                if not opinions:
+                    continue
+
+                op_id = opinions[0].get("id")
+                if not op_id:
+                    continue
+
+                abs_url = item.get("absolute_url")
+                if abs_url and not abs_url.startswith("http"):
+                    abs_url = "https://www.courtlistener.com" + abs_url
+
+                opinion = self._fetch_opinion_by_id(op_id)
+
+                results.append({
+                    "id": op_id,
+                    "url": abs_url,
+                    "case_name": item.get("caseName") or item.get("caseNameFull"),
+                    "citation": item.get("citation"),
+                    "content": opinion["content"],
+                    "retrieved_at": opinion["retrieved_at"],
+                })
+
+        except Exception as e:
+            print("[CourtListener] /search/ request failed:", repr(e))
+
+        # ---- if API path failed or gave nothing, fallback to scraping ---- #
+        if not results:
+            results = self._fallback_scrape_search(query, max_results=max_results)
+
+        return results
 
 # ------------------- SerpAPI helper ------------------- #
 def serpapi_search_json(query: str, num: int = 1) -> Dict[str, Any]:
