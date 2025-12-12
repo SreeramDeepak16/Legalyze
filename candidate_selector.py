@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------
 
 _CITATION_US_RE = re.compile(
-    r'(\d{1,4})\s*\.?\s*(u(?:nited)?\s*\.?\s*s\.?)\.?\s*(\d{1,4})',
+    r'(\d{1,4})\s*\.?\s*(u(?:nited)?\s*\.?\s*s\.? )?\.?\s*(\d{1,4})',
     re.IGNORECASE
 )
 
@@ -57,8 +57,9 @@ def citation_variants(citation: Optional[str]) -> List[str]:
 
     if m:
         first = m.group(1)
+        # use canonical mid form
         mid = "u.s."
-        last = m.group(3)
+        last = m.group(3) if m.lastindex and m.lastindex >= 3 else m.group(2)
         forms = [
             f"{first} {mid} {last}",
             f"{first} {mid}{last}",
@@ -223,24 +224,80 @@ def select_best_candidate(results: List[Dict],
         logger.info("select_best_candidate: no input results")
         return None
 
-    # Short-circuit citation match
+    # Short-circuit citation match (improved: prefer majority opinion when possible)
     query_citation_norm = normalize_text(query_citation)
     query_citation_variants = citation_variants(query_citation_norm)
 
-    for cand in results:
-        try:
-            citations_list = (
-                cand.get("citation")
-                or cand.get("citations")
-                or cand.get("citation_list")
-                or []
-            )
-            if isinstance(citations_list, str):
-                citations_list = [citations_list]
+    def _looks_like_dissent_or_concurrence(cand_text: str, cand_meta: Dict[str, Any]) -> bool:
+        """Return True if document text/meta strongly suggests dissent/concurring (i.e., not Opinion of the Court)."""
+        if not cand_text:
+            return False
+        txt = normalize_text(cand_text)
+        # obvious markers of dissent/concurrence
+        dissent_markers = ["dissent", "dissenting", "concurring", "dissent from", "concurring in part", "concurs"]
+        # markers of majority/opinion of the court
+        majority_markers = ["opinion of the court", "for the court", "opinion by", "rehnquist, j.", "scalia, j.", "kennedy, j."]
+        for m in dissent_markers:
+            if m in txt:
+                return True
+        # also check explicit fields (author/opinion_type) if present
+        ot = normalize_text(cand_meta.get("opinion_type") or cand_meta.get("type") or cand_meta.get("opinion") or "")
+        if any(m in ot for m in ["dissent", "concurring", "concurrence"]):
+            return True
+        # If it contains an obvious majority marker, treat as NOT dissent
+        if any(m in txt for m in majority_markers):
+            return False
+        return False
 
-            citations_norm = [normalize_text(str(x)) for x in citations_list]
+    # first pass: try to pick a candidate with matching citation that does NOT look like a dissent
+    for qc in query_citation_variants:
+        for cand in results:
+            try:
+                citations_list = (
+                    cand.get("citation")
+                    or cand.get("citations")
+                    or cand.get("citation_list")
+                    or []
+                )
+                if isinstance(citations_list, str):
+                    citations_list = [citations_list]
 
-            for qc in query_citation_variants:
+                citations_norm = [normalize_text(str(x)) for x in citations_list]
+
+                for c in citations_norm:
+                    if qc == c or qc in c or c in qc:
+                        cand_text = cand.get("content") or cand.get("plain_text") or cand.get("snippet") or ""
+                        if not _looks_like_dissent_or_concurrence(cand_text, cand):
+                            selected = dict(cand)
+                            auto_score = 10**6
+                            selected["_selection_score"] = auto_score
+                            selected["_selection_details"] = {
+                                "hits": [("citation_list_shortcircuit", qc)],
+                                "score": auto_score,
+                            }
+                            logger.info(
+                                "Short-circuit citation match (preferred majority) found. Auto-selected id=%s (qc=%s).",
+                                cand.get("id") or "<no-id>", qc
+                            )
+                            return selected
+            except Exception as e:
+                logger.debug("citation short-circuit check failed for id=%s: %s", cand.get("id") or "<no-id>", e)
+
+    # second pass: if no majority-like candidate found, fall back to original behavior
+    for qc in query_citation_variants:
+        for cand in results:
+            try:
+                citations_list = (
+                    cand.get("citation")
+                    or cand.get("citations")
+                    or cand.get("citation_list")
+                    or []
+                )
+                if isinstance(citations_list, str):
+                    citations_list = [citations_list]
+
+                citations_norm = [normalize_text(str(x)) for x in citations_list]
+
                 for c in citations_norm:
                     if qc == c or qc in c or c in qc:
                         selected = dict(cand)
@@ -251,16 +308,16 @@ def select_best_candidate(results: List[Dict],
                             "score": auto_score,
                         }
                         logger.info(
-                            "Short-circuit citation match found. Auto-selected id=%s (qc=%s).",
+                            "Short-circuit citation match found (fallback). Auto-selected id=%s (qc=%s).",
                             cand.get("id") or "<no-id>", qc
                         )
                         return selected
 
-        except Exception as e:
-            logger.debug(
-                "citation short-circuit check failed for id=%s: %s",
-                cand.get("id") or "<no-id>", e
-            )
+            except Exception as e:
+                logger.debug(
+                    "citation short-circuit check failed for id=%s: %s",
+                    cand.get("id") or "<no-id>", e
+                )
 
     # Compute scores normally
     scored: List[Tuple[int, Dict, Dict]] = []
