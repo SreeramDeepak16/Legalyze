@@ -9,11 +9,10 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, ValidationError
 
-# langchain / LLM wrappers (type-ignore if necessary)
+# type-ignore LLM wrappers if necessary
 from langchain_core.messages import HumanMessage  # type: ignore
 from langchain_google_genai import ChatGoogleGenerativeAI  # type: ignore
 
-# your search agent entrypoint
 from run_search_agent import run_all
 
 
@@ -32,18 +31,16 @@ class JudgeResult(BaseModel):
 
 
 # ----------------------------
-# Metadata helper functions
+# Helpers: domain, dates, jurisdictions, contradictions
 # ----------------------------
 _JURISDICTION_KEYWORDS = {
     "us": ["united states", "u.s.", "u.s", "us federal", "federal"],
     "india": ["india", "indian", "supreme court of india", "sc of india"],
     "uk": ["united kingdom", "england", "scotland", "uk"],
-    # expand as needed
 }
 
 
 def get_domain_type(url: Optional[str]) -> str:
-    """Heuristic domain classification: 'gov', 'edu', 'court_decision', 'news', 'user_generated', 'other', 'unknown'."""
     if not url:
         return "unknown"
     try:
@@ -51,7 +48,6 @@ def get_domain_type(url: Optional[str]) -> str:
         hostname = hostname.lower()
     except Exception:
         return "other"
-
     if hostname.endswith(".gov") or ".gov." in hostname:
         return "gov"
     if hostname.endswith(".edu") or ".edu." in hostname:
@@ -66,7 +62,6 @@ def get_domain_type(url: Optional[str]) -> str:
 
 
 def extract_years_and_dates(text: str) -> Dict[str, Optional[int]]:
-    """Return earliest and latest 4-digit years found; detect ISO-like dates presence."""
     years = [int(y) for y in re.findall(r"\b(19|20)\d{2}\b", text)]
     earliest = min(years) if years else None
     latest = max(years) if years else None
@@ -75,7 +70,6 @@ def extract_years_and_dates(text: str) -> Dict[str, Optional[int]]:
 
 
 def detect_jurisdictions(text: str, url: Optional[str]) -> List[str]:
-    """Keyword and TLD heuristics to detect jurisdictions mentioned or implied."""
     t = (text or "").lower()
     found: Set[str] = set()
     for key, kw_list in _JURISDICTION_KEYWORDS.items():
@@ -83,8 +77,6 @@ def detect_jurisdictions(text: str, url: Optional[str]) -> List[str]:
             if kw in t:
                 found.add(key)
                 break
-
-    # TLD hints
     try:
         hostname = urlparse(url).hostname or "" if url else ""
     except Exception:
@@ -96,28 +88,19 @@ def detect_jurisdictions(text: str, url: Optional[str]) -> List[str]:
         found.add("india")
     if hostname.endswith(".gov") and "usa" in hostname:
         found.add("us")
-
     return sorted(found)
 
 
 def contradiction_scan(text: str) -> Dict[str, Any]:
-    """
-    Conservative contradiction heuristic:
-      - Extract sentences with assertion-like verbs.
-      - Pairwise check for shared tokens and opposing polarity (negation present in one, not in the other).
-    Returns a short report (boolean + examples).
-    """
     sents = [s.strip() for s in re.split(r'[.\n]+', text) if s.strip()]
     assertions = []
     for s in sents:
         if re.search(r"\b(is|are|shall|must|prohib|allow|permits|forbid|not|no|never|except|unless)\b", s, re.I):
             assertions.append(s)
-
     contradictions = []
     STOP = {"the", "a", "an", "and", "or", "of", "to", "in", "on", "with", "for", "by", "that"}
     lowered = [re.sub(r'[^a-z0-9\s]', '', a.lower()) for a in assertions]
     tokenized = [set([w for w in a.split() if w and w not in STOP]) for a in lowered]
-
     for i in range(len(assertions)):
         for j in range(i + 1, len(assertions)):
             common = tokenized[i].intersection(tokenized[j])
@@ -131,12 +114,11 @@ def contradiction_scan(text: str) -> Dict[str, Any]:
                         "common_terms": sorted(list(common)),
                         "polarity_diff": (neg_i, neg_j),
                     })
-
     return {"has_contradiction": bool(contradictions), "examples": contradictions[:3]}
 
 
 # ----------------------------
-# WrapResult - per-search-result wrapper
+# WrapResult
 # ----------------------------
 class WrapResult:
     def __init__(self, d: Dict[str, Any], summary_limit: int = 1500):
@@ -156,43 +138,30 @@ class WrapResult:
     def build_metadata(self) -> Dict[str, Any]:
         text = (self.full_content or "").lower()
         title = (self.title or "").lower()
-
         basic = {
             "length": len(self.full_content),
             "word_count": len(self.full_content.split()),
             "title_in_text": title in text if title else False,
         }
-
-        # domain / authority
         domain_type = get_domain_type(self.source)
         basic["domain_type"] = domain_type
         basic["is_authoritative"] = domain_type in ("gov", "edu", "court_decision")
-
-        # years / dates
         dates = extract_years_and_dates(self.full_content)
         basic.update(dates)
-
-        # jurisdiction hints
         jurisdictions = detect_jurisdictions(self.full_content, self.source)
         basic["jurisdictions_detected"] = jurisdictions
-
-        # contradiction scan
         contradiction = contradiction_scan(self.full_content)
         basic["contradiction_scan"] = contradiction
-
-        # legacy quick-checks
         basic["has_supreme"] = "supreme" in text
         basic["has_united_states"] = "united states" in text
-
         return basic
 
 
 # ----------------------------
-# Memory for judge
+# Memory
 # ----------------------------
 class JudgeMemory:
     def __init__(self):
-        # store evaluaton dicts for inspectability
         self.memory: List[Dict[str, Any]] = []
 
     def save(self, evaluation: Dict[str, Any]) -> None:
@@ -203,7 +172,7 @@ class JudgeMemory:
 
 
 # ----------------------------
-# JudgeAgent: LLM prompt, invocation, parse
+# JudgeAgent
 # ----------------------------
 class JudgeAgent:
     def __init__(self, llm: ChatGoogleGenerativeAI, memory: JudgeMemory):
@@ -220,7 +189,6 @@ class JudgeAgent:
             f"METADATA: {json.dumps(r.metadata, ensure_ascii=False, indent=2)}"
             for r in results
         )
-
         past_eval_text = "\n".join(
             f"- Prev #{i+1}: sufficient={p.get('is_sufficient')}, missing={p.get('missing_information')}"
             for i, p in enumerate(past)
@@ -231,17 +199,15 @@ You are the JUDGE agent in a retrieval-validation pipeline. You MUST NOT summari
 Use the provided METADATA fields to perform these checks:
   1) SOURCE QUALITY CHECK:
      - Use 'domain_type' and 'is_authoritative' to mark authority (gov/edu/court_decision => high authority).
-     - Count authoritative vs user_generated and explain which results are authoritative.
+     - List the most authoritative sources you see.
   2) DATE CHECK:
      - Use 'earliest_year', 'latest_year', and 'has_iso_date' to determine currency.
-     - If important facts rely on older dates, flag as potentially outdated.
   3) JURISDICTION CHECK:
-     - Use 'jurisdictions_detected' and the URL to verify jurisdiction alignment with the user query.
-     - If user specified a jurisdiction in conversation history, check it.
+     - Use 'jurisdictions_detected' and the URL to verify jurisdiction alignment.
   4) CONTRADICTION SCAN:
-     - Use 'contradiction_scan' (has_contradiction + examples). If contradictions are present, explain their significance.
+     - Use 'contradiction_scan' (has_contradiction + examples).
   5) MISSING INFORMATION:
-     - Based on the query, name specific missing points (e.g., 'no primary court decision found on topic X', 'no statute cited', 'no recent confirmation (post-2020)').
+     - Based on the query, explicitly name specific missing points (e.g., 'no primary court decision found', 'no statute cited').
 
 Iteration: {iteration}
 
@@ -261,130 +227,224 @@ Return ONLY JSON in this format (valid JSON):
 {{
  "is_sufficient": true/false,
  "reasoning": "string (concise)",
- "source_quality": "string (briefly list authoritative sources and concerns)",
- "date_check": "string (currency assessment)",
- "jurisdiction_check": "string (match or mismatch details)",
- "contradiction_check": "string (summary, include examples if any)",
+ "source_quality": "string",
+ "date_check": "string",
+ "jurisdiction_check": "string",
+ "contradiction_check": "string",
  "missing_information": ["specific", "missing", "items"],
  "suggested_refinements": ["query refinements or terms to search next"]
 }}
 """
 
-    def _call_llm_and_parse(self, prompt: str) -> JudgeResult:
+    def _call_llm_and_parse(self, prompt: str) -> Dict[str, Any]:
         """
-        Calls the LLM and returns a validated JudgeResult.
-        Handles parsing errors and returns a safe fallback with reasoning included.
+        Call LLM robustly and return dict with keys:
+          - parsed (JudgeResult or fallback dict)
+          - raw_text (string)
         """
+        raw_text = ""
         try:
             msg = HumanMessage(content=prompt)
-            # Different wrappers expose different call signatures - try common ones
             if hasattr(self.llm, "invoke"):
                 llm_response = self.llm.invoke([msg])
             elif callable(self.llm):
                 llm_response = self.llm([msg])
             else:
-                # last-resort: try structured output if available
                 llm_response = self.llm
 
-            # extract textual content robustly
             if hasattr(llm_response, "content"):
-                content = llm_response.content
+                raw_text = llm_response.content
             elif isinstance(llm_response, dict) and "content" in llm_response:
-                content = llm_response["content"]
+                raw_text = llm_response["content"]
             elif isinstance(llm_response, str):
-                content = llm_response
+                raw_text = llm_response
             else:
-                content = str(llm_response)
+                raw_text = str(llm_response)
 
-            content = content.strip().strip("`").strip()
+            raw_text = raw_text.strip().strip("`").strip()
 
-            # First attempt: direct JSON parse
             json_obj = None
             try:
-                json_obj = json.loads(content)
+                json_obj = json.loads(raw_text)
             except json.JSONDecodeError:
-                # attempt to extract first {...} block in text
-                start = content.find("{")
-                end = content.rfind("}")
+                start = raw_text.find("{")
+                end = raw_text.rfind("}")
                 if start != -1 and end != -1 and end > start:
                     try:
-                        json_obj = json.loads(content[start:end+1])
+                        json_obj = json.loads(raw_text[start:end+1])
                     except json.JSONDecodeError:
                         json_obj = None
 
             if json_obj is None:
-                print("LLM returned unparsable JSON. Raw content excerpt:")
-                print(content[:1000])
-                return JudgeResult(
-                    is_sufficient=False,
-                    reasoning=f"LLM returned unparsable JSON. Raw content excerpt: {content[:1000]}",
-                    source_quality="unknown",
-                    date_check="unknown",
-                    jurisdiction_check="unknown",
-                    contradiction_check="unknown",
-                    missing_information=["LLM_parsing_failed"],
-                    suggested_refinements=[]
-                )
+                # return a fallback structure so calling code can include raw_text
+                return {"parsed": None, "raw_text": raw_text}
 
-            # Validate against the schema
             try:
                 jr = JudgeResult.parse_obj(json_obj)
-                return jr
-            except ValidationError as e:
-                print("LLM JSON did not match schema:", e)
-                print("Raw JSON object:", json_obj)
-                return JudgeResult(
-                    is_sufficient=False,
-                    reasoning=f"LLM JSON did not match schema: {e}. Raw JSON: {json_obj}",
-                    source_quality=json_obj.get("source_quality", ""),
-                    date_check=json_obj.get("date_check", ""),
-                    jurisdiction_check=json_obj.get("jurisdiction_check", ""),
-                    contradiction_check=json_obj.get("contradiction_check", ""),
-                    missing_information=json_obj.get("missing_information", []),
-                    suggested_refinements=json_obj.get("suggested_refinements", [])
-                )
+                return {"parsed": jr, "raw_text": raw_text}
+            except ValidationError:
+                return {"parsed": None, "raw_text": raw_text, "json_obj": json_obj}
 
-        except Exception as exc:
-            print("LLM call failed with exception:")
+        except Exception:
+            print("LLM call failed:")
             traceback.print_exc()
-            return JudgeResult(
+            return {"parsed": None, "raw_text": raw_text}
+
+    # Deterministic check helpers used for Option A
+    @staticmethod
+    def _extract_canonical_citation_from_query(q: str) -> Optional[str]:
+        if not q:
+            return None
+        m = re.search(r"\b(\d{1,4})\s*U\.?S\.?\s*(\d{1,4})\b", q, flags=re.I)
+        if m:
+            return f"{m.group(1)} u.s. {m.group(2)}".lower()
+        return None
+
+    @staticmethod
+    def _results_have_citation(results: Sequence[WrapResult], canonical_cite: str) -> bool:
+        if not canonical_cite:
+            return False
+        for r in results:
+            c = r.citation
+            if c:
+                try:
+                    cite_strs = [str(x).lower() for x in (c if isinstance(c, (list, tuple)) else [c])]
+                except Exception:
+                    cite_strs = [str(c).lower()]
+                for s in cite_strs:
+                    if canonical_cite in s:
+                        return True
+            if r.title and canonical_cite in r.title.lower():
+                return True
+            if canonical_cite in (r.full_content or "").lower():
+                return True
+        return False
+
+    @staticmethod
+    def _title_or_name_matches_query(results: Sequence[WrapResult], query: str) -> bool:
+        q = (query or "").lower()
+        for r in results:
+            if not r.title:
+                continue
+            if r.title.lower() in q or q in r.title.lower():
+                return True
+            # approximate: require at least two tokens from case name be shared
+            q_tokens = set(re.findall(r"[a-z0-9]+", q))
+            title_tokens = set(re.findall(r"[a-z0-9]+", (r.title or "").lower()))
+            if len(q_tokens.intersection(title_tokens)) >= 2:
+                return True
+        return False
+
+    @staticmethod
+    def _has_authoritative_result(results: Sequence[WrapResult]) -> bool:
+        return any(r.metadata.get("is_authoritative") for r in results)
+
+    def evaluate(self, query: str, results: Sequence[WrapResult], history: str, iteration: int) -> Dict[str, Any]:
+        prompt = self.build_prompt(query=query, results=results, past=self.memory.last_n(3), history=history, iteration=iteration)
+        llm_resp = self._call_llm_and_parse(prompt)
+
+        parsed = llm_resp.get("parsed")
+        raw_text = llm_resp.get("raw_text", "")
+
+        # Save raw LLM output and parsed json for audit
+        audit_entry: Dict[str, Any] = {"raw_llm": raw_text, "parsed": None}
+
+        # If parsing failed but json_obj present, include it
+        if parsed is None and "json_obj" in llm_resp:
+            audit_entry["parsed"] = llm_resp["json_obj"]
+        elif parsed is not None:
+            audit_entry["parsed"] = parsed.dict()
+
+        # Now apply Option A deterministic safety checks to determine final is_sufficient
+        canonical = self._extract_canonical_citation_from_query(query)
+        citation_present = self._results_have_citation(results, canonical) if canonical else False
+        authoritative_exists = self._has_authoritative_result(results)
+        title_match = self._title_or_name_matches_query(results, query)
+
+        # default fallback JudgeResult if LLM parsing failed
+        if parsed is None:
+            # LLM failed to return valid JSON -> mark insufficient and explain why
+            final_jr = JudgeResult(
                 is_sufficient=False,
-                reasoning=f"LLM invocation failed: {exc}",
-                source_quality="error",
-                date_check="error",
-                jurisdiction_check="error",
-                contradiction_check="error",
-                missing_information=["llm_error"],
+                reasoning="LLM did not return valid structured JSON evaluation; cannot trust sufficiency.",
+                source_quality="unknown",
+                date_check="unknown",
+                jurisdiction_check="unknown",
+                contradiction_check="unknown",
+                missing_information=["LLM_parsing_failed"],
                 suggested_refinements=[]
             )
+            self.memory.save({"audit": audit_entry, "final": final_jr.dict()})
+            return {"parsed_judge": final_jr, "raw_llm": raw_text}
 
-    def evaluate(self, query: str, results: Sequence[WrapResult], history: str, iteration: int) -> JudgeResult:
-        prompt = self.build_prompt(query=query, results=results, past=self.memory.last_n(3), history=history, iteration=iteration)
-        jr = self._call_llm_and_parse(prompt)
+        # At this point we have a parsed JudgeResult from LLM
+        jr: JudgeResult = parsed  # type: ignore
 
-        # Auto-mark: if LLM found no missing info, consider sufficient unless LLM explicitly says otherwise
-        if not jr.missing_information:
-            jr.is_sufficient = True
+        # Option A strict gating:
+        # Conditions required for final is_sufficient = True:
+        #  1) canonical citation exists in query AND citation_present True
+        #  2) authoritative_exists True
+        #  3) jr.is_sufficient is True (LLM agrees) AND jr.missing_information is empty
+        #  4) title_match or citation_present (basic content agreement)
+        reasons: List[str] = []
+        passed = True
 
-        # persist serializable dict
-        # include the parsed model output only
+        if not canonical:
+            reasons.append("Query does not contain a canonical reporter citation (e.g., '514 U.S. 549').")
+            passed = False
+        else:
+            if not citation_present:
+                reasons.append(f"Canonical citation '{canonical}' from query not found in any result.")
+                passed = False
+
+        if not authoritative_exists:
+            reasons.append("No authoritative result found (gov/edu/court_decision).")
+            passed = False
+
+        if not jr.is_sufficient:
+            reasons.append("LLM judged results as not sufficient.")
+            passed = False
+
+        if jr.missing_information:
+            reasons.append(f"LLM reported missing information: {jr.missing_information}")
+            passed = False
+
+        if not (title_match or citation_present):
+            reasons.append("No clear title/citation match between query and results.")
+            passed = False
+
+        # If any check failed, final result is insufficient; augment reasoning to be explicit
+        if passed:
+            final_jr = jr
+            final_jr.is_sufficient = True
+            final_jr.reasoning = (final_jr.reasoning or "") + " (Accepted by deterministic Option A checks: citation present, authoritative source, title/citation match.)"
+        else:
+            # Build a deterministic reasoning augmentation
+            augment = " | Deterministic checks failed: " + " ; ".join(reasons)
+            final_jr = jr
+            final_jr.is_sufficient = False
+            final_jr.reasoning = (final_jr.reasoning or "") + augment
+            # ensure missing_information mentions deterministic failures for visibility
+            for r in reasons:
+                if r not in final_jr.missing_information:
+                    final_jr.missing_information.append(r)
+
+        # Save both raw and final_jr to memory for auditing
         try:
-            self.memory.save(jr.dict())
+            self.memory.save({"audit": audit_entry, "final": final_jr.dict()})
         except Exception:
-            # fallback if pydantic dict method changes; store model_dump if available
+            # pydantic v2 compatibility
             try:
-                self.memory.save(jr.model_dump())  # pydantic v2 compatible
+                self.memory.save({"audit": audit_entry, "final": final_jr.model_dump()})
             except Exception:
-                print("Failed to save judge result to memory; storing minimal info.")
-                self.memory.save({"is_sufficient": jr.is_sufficient, "reasoning": jr.reasoning})
+                self.memory.save({"audit": audit_entry, "final": {"is_sufficient": final_jr.is_sufficient, "reasoning": final_jr.reasoning}})
 
-        return jr
+        return {"parsed_judge": final_jr, "raw_llm": raw_text}
 
 
 # ----------------------------
-# EvaluateAgent wrapper (top-level)
+# EvaluateAgent
 # ----------------------------
-
 class EvaluateAgent:
     def __init__(self, query: str, judge_key_env: str = "JUDGE_KEY"):
         api_key = os.getenv(judge_key_env)
@@ -404,15 +464,11 @@ class EvaluateAgent:
         self.results = self._normalize_raw_results(raw)
         self.current_query = self._extract_query(self.results) or query
 
-        # Run deterministic pre-check: if query contains a canonical citation (e.g., "514 U.S. 549"),
-        # ensure the results actually include it; otherwise force a targeted refinement search.
+        # deterministic pre-check: if query has canonical citation and results don't, try targeted refinement
         self._pre_refine_for_citation_if_needed(original_query=query)
 
     @staticmethod
     def _normalize_raw_results(raw: Any) -> List[WrapResult]:
-        """
-        Accept list-of-dicts or list-of-lists-of-dicts and return WrapResult list.
-        """
         normalized: List[Dict[str, Any]] = []
         if raw is None:
             return []
@@ -429,7 +485,6 @@ class EvaluateAgent:
                 normalized = list(raw)
             except Exception:
                 normalized = []
-
         return [WrapResult(d) for d in normalized if isinstance(d, dict)]
 
     @staticmethod
@@ -439,15 +494,8 @@ class EvaluateAgent:
                 return r.query
         return None
 
-    # ----------------------------
-    # NEW: deterministic citation detection
-    # ----------------------------
     @staticmethod
     def _extract_canonical_citation_from_query(q: str) -> Optional[str]:
-        """
-        Very small parser: look for patterns like '514 U.S. 549' or '514 U.S. 549 (1995)'.
-        Returns normalized lowercase string '514 u.s. 549' if found, else None.
-        """
         if not q:
             return None
         m = re.search(r"\b(\d{1,4})\s*U\.?S\.?\s*(\d{1,4})\b", q, flags=re.I)
@@ -457,17 +505,11 @@ class EvaluateAgent:
 
     @staticmethod
     def _results_have_citation(results: Sequence[WrapResult], canonical_cite: str) -> bool:
-        """
-        Check citations arrays, titles, and content for the canonical citation string.
-        canonical_cite should be normalized (lowercase) like '514 u.s. 549'.
-        """
         if not canonical_cite:
             return False
         for r in results:
-            # check citation list
             c = r.citation
             if c:
-                # normalize citation entries and check for both tokens  (e.g., '514' and '549')
                 try:
                     cite_strs = [str(x).lower() for x in (c if isinstance(c, (list, tuple)) else [c])]
                 except Exception:
@@ -475,65 +517,56 @@ class EvaluateAgent:
                 for s in cite_strs:
                     if canonical_cite in s:
                         return True
-            # check title
             if r.title and canonical_cite in r.title.lower():
                 return True
-            # check full_content for canonical cite
             if canonical_cite in (r.full_content or "").lower():
                 return True
         return False
 
     def _pre_refine_for_citation_if_needed(self, original_query: str) -> None:
-        """
-        If the user query contained a canonical reporter citation (e.g., '514 U.S. 549') but none of
-        the current results include that citation, issue a targeted re-query that prefers authoritative
-        domains (courtlistener, scotus.gov, oyez.org, justia) and replace self.results.
-        This increases the chance Judge will get direct evidence and reduces LLM hallucination.
-        """
         canonical = self._extract_canonical_citation_from_query(original_query)
         if not canonical:
-            return  # nothing to do
-
+            return
         if self._results_have_citation(self.results, canonical):
             print(f"Deterministic check: canonical citation present in initial results ({canonical}).")
             return
-
-        # Build a targeted refinement query that strongly biases authoritative hosts
         authoritative_sites = ["courtlistener.com", "scotus.gov", "oyez.org", "justia.com"]
         site_clause = " OR ".join([f"site:{s}" for s in authoritative_sites])
         refined_query = f"{original_query} {canonical} {site_clause}"
         print(f"Deterministic check: canonical citation {canonical} missing; running targeted refinement search: {refined_query}")
-
-        # Re-run search and update results
         try:
             raw = run_all(refined_query)
             new_results = self._normalize_raw_results(raw)
-            # If new results have the citation, adopt them; else keep original results but print warning
             if self._results_have_citation(new_results, canonical):
                 print("Targeted refinement found canonical citation; updating results.")
                 self.results = new_results
             else:
                 print("Targeted refinement did not find canonical citation. Keeping original results.")
-        except Exception as e:
-            print("Targeted refinement search failed with exception:")
+        except Exception:
+            print("Targeted refinement search failed:")
             traceback.print_exc()
-            # keep original results on failure
 
-    # ----------------------------
-    # run loop (unchanged except uses self.results from pre-refinement)
-    # ----------------------------
     def run(self, max_iterations: int = 3) -> Dict[str, Any]:
         iteration = 1
-        final: Optional[JudgeResult] = None
+        final = None
         seen_queries: Set[str] = {self.current_query} if self.current_query else set()
 
         while iteration <= max_iterations:
             print(f"\n===== ITERATION {iteration} =====")
-            jr = self.judge.evaluate(query=self.current_query, results=self.results, history="", iteration=iteration)
+            eval_out = self.judge.evaluate(query=self.current_query, results=self.results, history="", iteration=iteration)
+            jr: JudgeResult = eval_out["parsed_judge"]
+            raw_llm = eval_out.get("raw_llm", "")
 
             print("Sufficient?", jr.is_sufficient)
             print("Missing:", jr.missing_information)
             print("Refinements:", jr.suggested_refinements)
+            # For debugging: show whether deterministic gates passed
+            canonical = JudgeAgent._extract_canonical_citation_from_query(self.current_query)
+            citation_present = JudgeAgent._results_have_citation(self.results, canonical) if canonical else False
+            authoritative_exists = any(r.metadata.get("is_authoritative") for r in self.results)
+            title_match = JudgeAgent._title_or_name_matches_query(self.results, self.current_query)
+            print("Deterministic checks -> canonical:", canonical, "citation_present:", citation_present,
+                  "authoritative_exists:", authoritative_exists, "title_match:", title_match)
 
             final = jr
 
@@ -541,7 +574,6 @@ class EvaluateAgent:
                 print("Judge validated final set.")
                 break
 
-            # Choose next query
             if jr.suggested_refinements:
                 new_query = jr.suggested_refinements[0]
             elif jr.missing_information:
@@ -549,7 +581,6 @@ class EvaluateAgent:
             else:
                 new_query = self.current_query
 
-            # Prevent cycles
             if new_query in seen_queries:
                 print("Refinement cycle detected; stopping further iterations.")
                 break
@@ -561,7 +592,6 @@ class EvaluateAgent:
 
             raw = run_all(new_query)
             self.results = self._normalize_raw_results(raw)
-
             iteration += 1
 
         return {
@@ -573,7 +603,7 @@ class EvaluateAgent:
         }
 
 
-# Entrypoint test when run as script (optional)
+# Entrypoint
 if __name__ == "__main__":
     import argparse
     import sys
@@ -583,7 +613,6 @@ if __name__ == "__main__":
     parser.add_argument("--key-env", default="JUDGE_KEY", help="Environment variable containing the Judge API key")
     args = parser.parse_args()
 
-    # if not provided on CLI, prompt
     query = args.query
     if not query:
         if not sys.stdin.isatty():
