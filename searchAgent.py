@@ -1,206 +1,56 @@
-# SearchAgent.py (updated to use candidate_selector)
-from urllib.parse import urlparse
-from bs4 import BeautifulSoup #type:ignore
-from dotenv import load_dotenv #type:ignore
+# SearchAgent.py (fixed)
+from urllib.parse import urlparse, urljoin
+from bs4 import BeautifulSoup # type:ignore
+from dotenv import load_dotenv # type:ignore
 load_dotenv()
 
 import os
 import re
 import time
 from typing import List, Dict, Any, Optional
-import math
 
-import requests #type:ignore
+import requests # type:ignore
 
-from connectors import CourtListenerClient 
+from agents.connectors import CourtListenerClient
+from agents.meta_memory_manager import MetaMemoryManager
 from langchain_google_genai import ChatGoogleGenerativeAI #type:ignore
-# from agents.meta_memory_manager import MetaMemoryManager
 
-# import your selector (make sure candidate_selector.py is next to this file)
-from candidate_selector import select_best_candidate  # type: ignore
-
-# ---------- helpers ----------
-from typing import List, Dict, Any, Optional
-
-def pick_best_case(
-    results: List[Dict[str, Any]],
-    prefer_court_substr: str = "Supreme",
-    prefer_cite_substr: str = "U.S.",
-    prefer_name_substr: str = "Topeka",
-) -> Optional[Dict[str, Any]]:
-    """
-    Score and pick the best case from CourtListener results.
-
-    Scoring heuristics:
-      +3 if `court` contains prefer_court_substr (e.g., "Supreme")
-      +2 if any citation contains prefer_cite_substr (e.g., "U.S.")
-      +1 if case name contains prefer_name_substr (e.g., "Topeka")
-      small preference for earlier results
-
-    Returns the best result dict or None if no results.
-    """
-    if not results:
-        return None
-
-    def _field_text(val):
-        if val is None:
-            return ""
-        if isinstance(val, list):
-            return " ".join(str(x) for x in val).lower()
-        return str(val).lower()
-
-    best = None
-    best_score = float("-inf")
-    for idx, r in enumerate(results):
-        score = 0.0
-        court = _field_text(r.get("court") or r.get("case_court") or r.get("source_court"))
-        case_name = _field_text(r.get("case_name") or r.get("title") or "")
-        citation = _field_text(r.get("citation") or "")
-
-        if prefer_court_substr.lower() in court:
-            score += 3.0
-        if prefer_cite_substr.lower() in citation:
-            score += 2.0
-        if prefer_name_substr.lower() in case_name:
-            score += 1.0
-
-        # small boost for items earlier in the list
-        score += max(0.0, 1.0 - idx * 0.05)
-
-        # a tiny penalty for empty content (if content available)
-        content_len = len(str(r.get("content") or ""))
-        if content_len < 300:
-            score -= 0.5
-
-        if score > best_score:
-            best_score = score
-            best = r
-
-    return best
-
-import re
-from urllib.parse import urlparse
+from agents.candidate_selector import select_best_candidate  # type: ignore
 
 CITATION_RE = re.compile(r'(\d{1,4})\s+U\.?S\.?\s+(\d{1,4})', re.IGNORECASE)
 
-def normalize_text(s):
+
+def normalize_text(s: Optional[Any]) -> str:
+    if s is None:
+        return ""
     if isinstance(s, list):
-        s = " ".join([str(x) for x in s])
-    return (s or "").lower().strip()
-
-def pick_best_case(
-    results: List[Dict[str, Any]],
-    query: str = "",
-    prefer_court_substr: str = "",
-    prefer_cite_substr: str = "",
-    prefer_name_substr: str = "",
-) -> Optional[Dict[str, Any]]:
-    if not results:
-        return None
-
-    query_norm = normalize_text(query)
-    # if query contains an explicit "U.S." citation, prefer items that include that exact citation substring
-    cite_match = CITATION_RE.search(query)
-    explicit_cite = None
-    if cite_match:
-        explicit_cite = f"{cite_match.group(1)} u.s. {cite_match.group(2)}"
-
-    def _field_text(val):
-        if val is None:
-            return ""
-        if isinstance(val, list):
-            return " ".join(str(x) for x in val).lower()
-        return str(val).lower()
-
-    best = None
-    best_score = float("-inf")
-    for idx, r in enumerate(results):
-        score = 0.0
-        court = _field_text(r.get("court") or r.get("case_court") or r.get("source_court") or r.get("court_name"))
-        case_name = _field_text(r.get("case_name") or r.get("title") or r.get("name"))
-        citation = _field_text(r.get("citation") or r.get("citations") or "")
-
-        # exact citation match is highest priority
-        if explicit_cite and explicit_cite in citation:
-            score += 8.0
-
-        # prefer court substring if present
-        if prefer_court_substr and prefer_court_substr.lower() in court:
-            score += 3.0
-
-        # prefer citation hint (loose)
-        if prefer_cite_substr and prefer_cite_substr.lower() in citation:
-            score += 2.0
-
-        # prefer name hint only if query contained that name
-        if prefer_name_substr and prefer_name_substr.lower() in query_norm and prefer_name_substr.lower() in case_name:
-            score += 1.0
-
-        # small boost for earlier results
-        score += max(0.0, 1.0 - idx * 0.05)
-
-        # penalize extremely short or missing content
-        content_len = len(str(r.get("content") or r.get("plain_text") or ""))
-        if content_len < 200:
-            score -= 1.0
-
-        # mild bonus if query tokens appear in title or citation or content
-        qtokens = [t for t in re.split(r'\s+', query_norm) if t]
-        matches = 0
-        haystack = " ".join([case_name, citation, str(r.get("content") or "")])
-        for t in qtokens[:6]:  # check a few tokens
-            if t and t in haystack:
-                matches += 1
-        score += 0.3 * matches
-
-        if score > best_score:
-            best_score = score
-            best = r
-
-    return best
+        s = " ".join(str(x) for x in s)
+    return str(s).lower().strip()
 
 
-# ---------- SearchAgent ----------
 class SearchAgent:
     def __init__(self):
         self.courtlistener = CourtListenerClient()
         self.serpapi_key = os.getenv("SERPAPI_API_KEY")
         # self.meta_manager = MetaMemoryManager()
 
-        
-    # ----- Mirix (assumed to return content/snippet) -----
     # def search_mirix_paragraph(self, q: str, top_k: int = 3) -> List[Dict[str, Any]]:
     #     results = self.meta_manager.dispatch(q)
-    #     agent_results = results["agent_results"]["retrieval"]
-    #     memories = list(agent_results.keys())
-    #     out:List[Dict[str,Any]] = []
-    #     for memory in memories:
-    #         if agent_results[memory]!=None:
+    #     agent_results = results.get("agent_results", {}).get("retrieval", {})
+    #     out: List[Dict[str, Any]] = []
+    #     for memory, val in agent_results.items():
+    #         if val is not None:
     #             out.append({
-    #                 "query":q,
+    #                 "query": q,
     #                 "backend": "mirix",
     #                 "source": memory,
     #                 "title": None,
-    #                 "content": agent_results[memory]})
-                
+    #                 "content": val
+    #             })
     #     return out
-    # ----- CourtListener -----
-    CITATION_RE = re.compile(r'(\d{1,4})\s+U\.?S\.?\s+(\d{1,4})', re.IGNORECASE)
 
     def search_courtlistener_paragraph(self, q: str, top_k: int = 1, prefer_scotus: bool = True) -> List[Dict[str, Any]]:
-        """
-        CourtListener search that *returns an empty list* whenever no reliable candidate is found.
-
-        Behavior summary:
-        - Requests up to `max_candidates` from CourtListener.
-        - Uses select_best_candidate(...) to pick a candidate.
-        - If select_best_candidate returns None -> return [] (no CourtListener answer).
-        - Performs two safety checks (short content, citation match). If either fails -> return [].
-        - If a candidate is selected, ensure content is filled, attach `_source_confidence`, and return up to top_k items.
-        """
         max_candidates = max(top_k, 12)
-
-        # 1) Request candidates
         try:
             results = self.courtlistener.search_with_content(q, max_results=max_candidates)
         except Exception as e:
@@ -210,7 +60,6 @@ class SearchAgent:
         if not results:
             return []
 
-        # 2) Extract citation hint and conservative case-name hint
         cite_match = CITATION_RE.search(q)
         prefer_cite = ""
         if cite_match:
@@ -221,45 +70,38 @@ class SearchAgent:
         if m_case:
             case_name_hint = m_case.group(1).strip()
 
-        # 3) Use selector (this respects citation short-circuit internally)
         try:
             selected = select_best_candidate(results, query_case=case_name_hint or "", query_citation=prefer_cite or "")
         except Exception as e:
             print("[selector] error calling select_best_candidate:", repr(e))
             selected = None
 
-        # 4) If selector says "no reliable candidate", return empty list (do not fallback to weak heuristics)
         if selected is None:
             print("[courtlistener] selector returned no reliable candidate -> returning empty list")
             return []
 
-        # 5) Ensure selected has content (selector returns a shallow copy sometimes)
-        best = dict(selected)  # work on a shallow copy
+        best = dict(selected)
         if not best.get("content"):
             sel_id = best.get("id") or best.get("doc_id") or best.get("source")
             for r in results:
                 if str(r.get("id")) == str(sel_id) or str(r.get("doc_id")) == str(sel_id) or str(r.get("source")) == str(sel_id):
                     best["content"] = r.get("content") or r.get("plain_text") or r.get("casebody_text") or ""
-                    # try to inherit citation/title if missing
                     if not best.get("citation"):
                         best["citation"] = r.get("citation") or r.get("citations")
                     if not best.get("title"):
                         best["title"] = r.get("case_name") or r.get("title")
                     break
 
-        # 6) Safety check A: content length must be reasonably large
         first_content = (best.get("content") or "")
         if len(first_content) < 200:
             print("[courtlistener] selected candidate content too short -> returning empty list")
             return []
 
-        # 7) Safety check B: if query included an explicit U.S. citation, ensure selected contains the expected reporter number
         if cite_match:
             expected_num = str(cite_match.group(1))
             cit_field = normalize_text(best.get("citation") or "")
             content_field = normalize_text(first_content)
             if expected_num not in cit_field and expected_num not in content_field:
-                # try to find any result among original results that contains the citation digits
                 found = None
                 for r in results:
                     rcit = normalize_text(r.get("citation") or "")
@@ -271,37 +113,30 @@ class SearchAgent:
                     print("[courtlistener] citation mismatch and no alternative matched -> returning empty list")
                     return []
                 else:
-                    # adopt the found result as the best candidate
                     best = dict(found)
                     if not best.get("content"):
                         best["content"] = found.get("content") or found.get("plain_text") or ""
-
                     if len(best.get("content", "")) < 200:
                         print("[courtlistener] fallback-matched candidate content too short -> returning empty list")
                         return []
 
-        # 8) Attach a simple _source_confidence metric based on selection score (if present)
         sel_score = None
         if isinstance(best.get("_selection_score"), (int, float)):
-            sel_score = float(best["_selection_score"])
+            sel_score = float(best.get("_selection_score"))
         elif isinstance(selected.get("_selection_details"), dict) and isinstance(selected["_selection_details"].get("score"), (int, float)):
             sel_score = float(selected["_selection_details"]["score"])
 
-        # Map sel_score -> [0.0, 1.0] conservatively
         confidence = 0.0
         if sel_score is not None:
-            if sel_score >= 1_000_000:  # citation short-circuit
+            if sel_score >= 1_000_000:
                 confidence = 1.0
             else:
-                # normalize: treat 60 as low threshold, 300+ as very strong; clamp to 1.0
                 confidence = min(1.0, max(0.0, (sel_score / 300.0)))
         else:
-            # fallback conservative confidence for non-scored selections
             confidence = 0.5
 
         best["_source_confidence"] = confidence
 
-        # 9) Produce ordered list: prefer best, then original order (but do not return junk)
         ordered = []
         if top_k == 1:
             ordered = [best]
@@ -317,7 +152,6 @@ class SearchAgent:
                 if len(ordered) >= top_k:
                     break
 
-        # 10) Normalize output shape and return
         out = []
         for r in ordered[:top_k]:
             content = r.get("content") or r.get("plain_text") or r.get("casebody_text") or ""
@@ -337,21 +171,19 @@ class SearchAgent:
 
         return out
 
-
-    # ----- Web search (SerpAPI) -----
     def search_web_paragraph(self, q: str, top_k: int = 1, preferred_domain: Optional[str] = None) -> List[Dict[str, Any]]:
         """
-        Uses SerpAPI (serpapi.com). Requires SERPAPI_API_KEY in .env.
-
-        Returns a list containing AT MOST ONE hit (the first valid source found).
-        - If preferred_domain is set (e.g. 'wikipedia.org'), only considers results from that domain.
-        - Requests a few SerpAPI results (num=5) so we can skip blocked/empty results and still return one.
+        SerpAPI -> attempt best extraction from each organic result.
+        Fallbacks:
+        1) HTML extraction using BeautifulSoup with browser-like headers.
+        2) Direct PDF parsing if Content-Type indicates PDF or linked PDF found on page.
+        3) Jina.ai text-extraction proxy (https://r.jina.ai/http/<url>) if site blocks fetches (403) or extraction is poor.
+        Returns up to `top_k` hits.
         """
         if not self.serpapi_key:
             return []
 
         serp_url = "https://serpapi.com/search.json"
-        # ask for a few results so we can skip bad ones and still return one
         params = {"engine": "google", "q": q, "api_key": self.serpapi_key, "num": max(5, top_k)}
         try:
             r = requests.get(serp_url, params=params, timeout=15)
@@ -361,40 +193,70 @@ class SearchAgent:
             print("[web] SerpAPI error:", repr(e))
             return []
 
-        organic = data.get("organic_results") or data.get("organic", []) or []
-        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        organic = data.get("organic_results") or data.get("organic") or []
+        hits: List[Dict[str, Any]] = []
+
+        # simple pool of modern user agents to reduce bot blocks
+        USER_AGENTS = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Safari/605.1.15",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        ]
 
         def domain_of(url: Optional[str]) -> Optional[str]:
             if not url:
                 return None
             try:
-                from urllib.parse import urlparse
                 return urlparse(url).netloc.lower().lstrip("www.")
             except Exception:
                 return None
 
-        # iterate through organic results and return the first good one
+        def try_fetch_with_headers(url: str, timeout: int = 18):
+            """Return (response_or_none, status, used_headers)"""
+            import random
+            headers = {
+                "User-Agent": random.choice(USER_AGENTS),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://www.google.com/",
+                "Connection": "keep-alive",
+            }
+            try:
+                rr = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+                rr.raise_for_status()
+                return rr, rr.status_code, headers
+            except requests.exceptions.HTTPError as he:
+                return he.response if isinstance(he, requests.exceptions.HTTPError) else None, getattr(he.response, "status_code", None), headers
+            except Exception:
+                return None, None, headers
+
         for item in organic:
+            if len(hits) >= top_k:
+                break
+
             link = item.get("link") or item.get("url")
             title = item.get("title") or ""
             serp_snippet = item.get("snippet") or item.get("snippet_highlighted") or ""
-
-            # filter by preferred domain if requested
             if preferred_domain:
                 d = domain_of(link)
                 if not d or preferred_domain.lower().lstrip("www.") not in d:
                     continue
 
-            content = ""
-            if not link:
-                content = serp_snippet
-            else:
-                try:
-                    rr = requests.get(link, headers={"User-Agent": "mirix-search-agent/1.0"}, timeout=15)
-                    rr.raise_for_status()
-                    ctype = (rr.headers.get("Content-Type") or "").lower()
-
-                    # PDF handling
+            final_text = ""
+            # Try primary fetch + extraction, with a few retries
+            tried_jina = False
+            for attempt in range(3):
+                if not link:
+                    final_text = serp_snippet or ""
+                    break
+                rr, status, used_headers = try_fetch_with_headers(link)
+                # If we got a proper response object and status is OK
+                if rr is not None and getattr(rr, "status_code", 0) == 200:
+                    try:
+                        ctype = (rr.headers.get("Content-Type") or "").lower()
+                    except Exception:
+                        ctype = ""
+                    # PDF direct
                     if "application/pdf" in ctype or (link and link.lower().endswith(".pdf")):
                         try:
                             import io
@@ -403,47 +265,174 @@ class SearchAgent:
                             reader = PdfReader(io.BytesIO(pdf_bytes))
                             pages = []
                             for i, page in enumerate(reader.pages):
-                                if i >= 20:
+                                if i >= 120:
                                     break
                                 try:
                                     text = page.extract_text() or ""
                                 except Exception:
                                     text = ""
-                                pages.append(text)
-                            content = "\n\n".join(pages).strip()
+                                if text:
+                                    pages.append(text)
+                            final_text = "\n\n".join(pages).strip()
                         except Exception as e:
-                            print("PDF parsing failed (pypdf):", repr(e))
-                            content = ""
+                            print("[web] PDF parsing failed (direct):", repr(e))
+                            final_text = ""
                     else:
-                        # HTML handling
+                        # HTML extraction
                         try:
+                            from bs4 import BeautifulSoup
                             soup = BeautifulSoup(rr.text, "html.parser")
-                            paragraphs = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
-                            content = "\n\n".join(paragraphs).strip()
-                            if len(content) < 200:
-                                content = soup.get_text(" ", strip=True)
-                        except Exception as e:
-                            print("HTML parsing failed:", repr(e))
-                            content = ""
-                except Exception as e:
-                    print("Fetching link failed:", repr(e))
-                    content = ""
+                            # quick cleaning
+                            for bad in soup(["script", "style", "nav", "header", "footer", "aside", "form", "noscript"]):
+                                bad.decompose()
+                            for br in soup.find_all("br"):
+                                br.replace_with("\n")
 
-            final_text = content or serp_snippet or ""
-            if not final_text:
-                # nothing usable from this result -> try next
+                            # look for linked PDFs first
+                            pdf_url = None
+                            try:
+                                for a in soup.find_all("a", href=True):
+                                    href = a["href"].strip()
+                                    if href.lower().endswith(".pdf"):
+                                        pdf_url = href
+                                        break
+                                    if "pdf" in href.lower() and (href.lower().startswith("http") or href.startswith("/")):
+                                        pdf_url = href
+                                        break
+                                if pdf_url:
+                                    from urllib.parse import urljoin
+                                    pdf_url = urljoin(rr.url, pdf_url)
+                                    rr_pdf, status_pdf, _ = try_fetch_with_headers(pdf_url, timeout=20)
+                                    if rr_pdf is not None and getattr(rr_pdf, "status_code", 0) == 200:
+                                        try:
+                                            import io
+                                            from pypdf import PdfReader
+                                            reader = PdfReader(io.BytesIO(rr_pdf.content))
+                                            pages = []
+                                            for i, page in enumerate(reader.pages):
+                                                if i >= 120:
+                                                    break
+                                                try:
+                                                    text = page.extract_text() or ""
+                                                except Exception:
+                                                    text = ""
+                                                if text:
+                                                    pages.append(text)
+                                            if pages:
+                                                final_text = "\n\n".join(pages).strip()
+                                        except Exception:
+                                            pass
+                            except Exception:
+                                pass
+
+                            # if no PDF text or too short, try JSON-LD/meta/og/article selectors
+                            if not final_text or len(final_text) < 400:
+                                try:
+                                    og = soup.find("meta", property="og:description") or soup.find("meta", attrs={"name": "description"})
+                                    if og and og.get("content"):
+                                        mtext = og.get("content").strip()
+                                        if len(mtext) > len(final_text):
+                                            final_text = mtext
+
+                                    for script in soup.find_all("script", {"type": "application/ld+json"}):
+                                        try:
+                                            import json
+                                            payload = json.loads(script.string or "{}")
+                                            candidates = payload if isinstance(payload, list) else [payload] if isinstance(payload, dict) else []
+                                            for c in candidates:
+                                                if isinstance(c, dict):
+                                                    ab = c.get("articleBody") or c.get("description") or c.get("text")
+                                                    if isinstance(ab, str) and len(ab) > len(final_text):
+                                                        final_text = ab.strip()
+                                                        break
+                                        except Exception:
+                                            continue
+                                except Exception:
+                                    pass
+
+                            # opinion / content containers and large blocks
+                            if not final_text or len(final_text) < 400:
+                                try:
+                                    selectors = [
+                                        "div.opinion", "div#opinion", "div.content", "div.casetext",
+                                        "div.casebody", "div.opinionText", "article", "div#main", "div#content",
+                                        "section.opinion", "div#opinionBody"
+                                    ]
+                                    found_blocks = []
+                                    for sel in selectors:
+                                        parts = soup.select(sel)
+                                        if parts:
+                                            for p in parts:
+                                                text = p.get_text(" ", strip=True)
+                                                if len(text) > 200:
+                                                    found_blocks.append(text)
+                                    if found_blocks:
+                                        final_text = "\n\n".join(found_blocks)
+                                    else:
+                                        blocks = []
+                                        for tag in soup.find_all(["p", "div", "article", "section"]):
+                                            txt = tag.get_text(" ", strip=True)
+                                            if len(txt) > 250:
+                                                blocks.append(txt)
+                                        if blocks:
+                                            final_text = "\n\n".join(blocks)
+                                        else:
+                                            text = soup.get_text(" ", strip=True)
+                                            if len(text) > 400:
+                                                final_text = text
+                                except Exception as e:
+                                    print("[web] HTML parsing failed:", repr(e))
+                                    final_text = ""
+                        except Exception as e:
+                            print("[web] BeautifulSoup parse error:", repr(e))
+                            final_text = ""
+                else:
+                    # 403 or other non-200 -> try fallback proxies or jina.ai
+                    if getattr(rr, "status_code", None) == 403:
+                        # attempt Jina.ai text extraction fallback once
+                        if not tried_jina:
+                            tried_jina = True
+                            try:
+                                # jina expects the raw target url after /http:// or /https://
+                                cleaned = link.replace("https://", "").replace("http://", "")
+                                jina_url = f"https://r.jina.ai/http://{cleaned}"
+                                jr = requests.get(jina_url, headers={"User-Agent": USER_AGENTS[0]}, timeout=18)
+                                jr.raise_for_status()
+                                text = jr.text or ""
+                                if text and len(text) > 200:
+                                    final_text = text.strip()
+                                    break
+                            except Exception as e:
+                                # jina fallback failed, continue attempts
+                                print("[web] jina.ai fallback failed:", repr(e))
+                    # small sleep/backoff
+                    time.sleep(0.8 * (attempt + 1))
+                    continue
+
+                # if we got to here and final_text is long enough, break
+                if final_text and len(final_text) >= 400:
+                    break
+
+                # if too short, try a short delay and retry (sometimes servers give better content after redirect/resolving)
+                time.sleep(0.6)
+
+            # final fallback to serp snippet
+            if not final_text or len(final_text) < 200:
+                final_text = serp_snippet or final_text or ""
+
+            if not final_text or len(final_text.strip()) < 150:
+                # skip poor hits
                 continue
 
-            # para = choose_best_paragraph(final_text, q, title)
             hit = {
-                "query":q,
+                "query": q,
                 "backend": "web",
                 "source": link,
                 "title": title,
                 "content": final_text,
+                "retrieved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "_serp_meta": {"position": organic.index(item) if item in organic else None}
             }
-            # return a single-item list (first good source)
-            return [hit]
+            hits.append(hit)
 
-        # if we reach here: no usable hits
-        return []
+        return hits[:top_k]
