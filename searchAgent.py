@@ -185,140 +185,155 @@ class SearchAgent:
                 
     #     return out
     # ----- CourtListener -----
+    CITATION_RE = re.compile(r'(\d{1,4})\s+U\.?S\.?\s+(\d{1,4})', re.IGNORECASE)
+
     def search_courtlistener_paragraph(self, q: str, top_k: int = 1, prefer_scotus: bool = True) -> List[Dict[str, Any]]:
-        max_candidates = max(top_k, 12)  # request more candidates
-        results = self.courtlistener.search_with_content(q, max_results=max_candidates)
+        """
+        CourtListener search that *returns an empty list* whenever no reliable candidate is found.
+
+        Behavior summary:
+        - Requests up to `max_candidates` from CourtListener.
+        - Uses select_best_candidate(...) to pick a candidate.
+        - If select_best_candidate returns None -> return [] (no CourtListener answer).
+        - Performs two safety checks (short content, citation match). If either fails -> return [].
+        - If a candidate is selected, ensure content is filled, attach `_source_confidence`, and return up to top_k items.
+        """
+        max_candidates = max(top_k, 12)
+
+        # 1) Request candidates
+        try:
+            results = self.courtlistener.search_with_content(q, max_results=max_candidates)
+        except Exception as e:
+            print("[courtlistener] search_with_content failed:", repr(e))
+            return []
 
         if not results:
             return []
 
-        # extract citation and a heuristic case-name from query for selector
+        # 2) Extract citation hint and conservative case-name hint
         cite_match = CITATION_RE.search(q)
         prefer_cite = ""
         if cite_match:
             prefer_cite = f"{cite_match.group(1)} U.S."
 
-        # heuristic case name extraction (very conservative)
         case_name_hint = None
-        # look for patterns like "X v. Y" or "X vs Y"
         m_case = re.search(r'([A-Za-z0-9\.\'"\-\s,&]+?\bv\.?\b[\sA-Za-z0-9\.\'"\-\s,&]+)', q, flags=re.I)
         if m_case:
             case_name_hint = m_case.group(1).strip()
 
-        # Try the candidate_selector first (this will honor short-circuit citation automatch if implemented)
+        # 3) Use selector (this respects citation short-circuit internally)
         try:
             selected = select_best_candidate(results, query_case=case_name_hint or "", query_citation=prefer_cite or "")
         except Exception as e:
-            # selector may raise if unexpected shape; log and fallback to existing heuristics
             print("[selector] error calling select_best_candidate:", repr(e))
             selected = None
 
-        best = None
-        # If selector returned a valid candidate, use that (it may be auto-shortcircuit)
-        if selected:
-            # selected is a shallow copy from select_best_candidate; it should contain id/title/citation/content or similar
-            best = selected
-            # but ensure we have a 'content' field; if missing try to find same id in original results and copy content
-            if not best.get("content"):
-                sel_id = best.get("id") or best.get("doc_id")
+        # 4) If selector says "no reliable candidate", return empty list (do not fallback to weak heuristics)
+        if selected is None:
+            print("[courtlistener] selector returned no reliable candidate -> returning empty list")
+            return []
+
+        # 5) Ensure selected has content (selector returns a shallow copy sometimes)
+        best = dict(selected)  # work on a shallow copy
+        if not best.get("content"):
+            sel_id = best.get("id") or best.get("doc_id") or best.get("source")
+            for r in results:
+                if str(r.get("id")) == str(sel_id) or str(r.get("doc_id")) == str(sel_id) or str(r.get("source")) == str(sel_id):
+                    best["content"] = r.get("content") or r.get("plain_text") or r.get("casebody_text") or ""
+                    # try to inherit citation/title if missing
+                    if not best.get("citation"):
+                        best["citation"] = r.get("citation") or r.get("citations")
+                    if not best.get("title"):
+                        best["title"] = r.get("case_name") or r.get("title")
+                    break
+
+        # 6) Safety check A: content length must be reasonably large
+        first_content = (best.get("content") or "")
+        if len(first_content) < 200:
+            print("[courtlistener] selected candidate content too short -> returning empty list")
+            return []
+
+        # 7) Safety check B: if query included an explicit U.S. citation, ensure selected contains the expected reporter number
+        if cite_match:
+            expected_num = str(cite_match.group(1))
+            cit_field = normalize_text(best.get("citation") or "")
+            content_field = normalize_text(first_content)
+            if expected_num not in cit_field and expected_num not in content_field:
+                # try to find any result among original results that contains the citation digits
+                found = None
                 for r in results:
-                    if str(r.get("id")) == str(sel_id) or str(r.get("doc_id")) == str(sel_id):
-                        best["content"] = r.get("content") or r.get("plain_text") or r.get("casebody_text") or ""
+                    rcit = normalize_text(r.get("citation") or "")
+                    rcontent = normalize_text(r.get("content") or r.get("plain_text") or "")
+                    if expected_num in rcit or expected_num in rcontent:
+                        found = r
                         break
-        else:
-            # fallback to your original heuristic
-            prefer_name = ""
-            if "topeka" in q.lower():
-                prefer_name = "Topeka"
+                if found is None:
+                    print("[courtlistener] citation mismatch and no alternative matched -> returning empty list")
+                    return []
+                else:
+                    # adopt the found result as the best candidate
+                    best = dict(found)
+                    if not best.get("content"):
+                        best["content"] = found.get("content") or found.get("plain_text") or ""
 
-            if prefer_scotus:
-                best = pick_best_case(results,
-                                    query=q,
-                                    prefer_court_substr="Supreme",
-                                    prefer_cite_substr=prefer_cite or "U.S.",
-                                    prefer_name_substr=prefer_name)
+                    if len(best.get("content", "")) < 200:
+                        print("[courtlistener] fallback-matched candidate content too short -> returning empty list")
+                        return []
+
+        # 8) Attach a simple _source_confidence metric based on selection score (if present)
+        sel_score = None
+        if isinstance(best.get("_selection_score"), (int, float)):
+            sel_score = float(best["_selection_score"])
+        elif isinstance(selected.get("_selection_details"), dict) and isinstance(selected["_selection_details"].get("score"), (int, float)):
+            sel_score = float(selected["_selection_details"]["score"])
+
+        # Map sel_score -> [0.0, 1.0] conservatively
+        confidence = 0.0
+        if sel_score is not None:
+            if sel_score >= 1_000_000:  # citation short-circuit
+                confidence = 1.0
             else:
-                best = pick_best_case(results, query=q, prefer_court_substr="", prefer_cite_substr=prefer_cite, prefer_name_substr=prefer_name)
+                # normalize: treat 60 as low threshold, 300+ as very strong; clamp to 1.0
+                confidence = min(1.0, max(0.0, (sel_score / 300.0)))
+        else:
+            # fallback conservative confidence for non-scored selections
+            confidence = 0.5
 
-        # produce ordered list (keep original ordering after the chosen best)
+        best["_source_confidence"] = confidence
+
+        # 9) Produce ordered list: prefer best, then original order (but do not return junk)
         ordered = []
         if top_k == 1:
-            chosen = best or results[0]
-            ordered = [chosen]
+            ordered = [best]
         else:
             seen_ids = set()
-            if best:
-                ordered.append(best); seen_ids.add(best.get("id"))
+            ordered.append(best); seen_ids.add(str(best.get("id") or best.get("doc_id") or best.get("source")))
             for r in results:
-                if r.get("id") in seen_ids:
+                rid = str(r.get("id") or r.get("doc_id") or r.get("source"))
+                if rid in seen_ids:
                     continue
-                ordered.append(r); seen_ids.add(r.get("id"))
+                ordered.append(r)
+                seen_ids.add(rid)
                 if len(ordered) >= top_k:
                     break
 
+        # 10) Normalize output shape and return
         out = []
         for r in ordered[:top_k]:
-            # normalize fields / prefer longer content fields if available
             content = r.get("content") or r.get("plain_text") or r.get("casebody_text") or ""
-            # if the selector returned a shallow-copied selected object, it may already have "content"; prefer it
-            if isinstance(r, dict) and r.get("_selection_score") and not content:
-                # try to locate original result content
-                orig_id = r.get("id")
-                for rr in results:
-                    if str(rr.get("id")) == str(orig_id):
-                        content = rr.get("content") or rr.get("plain_text") or ""
-                        break
-
-            # debug logging
-            print("[courtlistener] chosen id:", r.get("id"), "title:", r.get("case_name") or r.get("title"), "citation:", r.get("citation"), "content_len:", len(content))
             out.append({
                 "query": q,
                 "backend": "courtlistener",
                 "id": r.get("id"),
                 "source": r.get("url") or r.get("resource") or r.get("source"),
-                "title": r.get("case_name") or r.get("title"),
-                "citation": r.get("citation"),
+                "title": r.get("case_name") or r.get("title") or r.get("name"),
+                "citation": r.get("citation") or r.get("citations"),
                 "content": content,
                 "retrieved_at": r.get("retrieved_at"),
-                # preserve selection metadata if present
                 "_selection_score": r.get("_selection_score"),
                 "_selection_details": r.get("_selection_details"),
+                "_source_confidence": r.get("_source_confidence", confidence if r is best else 0.0),
             })
-
-        # extra safety: if content is very short or clearly not matching the explicit citation in query, fallback to web search
-        first = out[0] if out else None
-        if first:
-            if len(first["content"]) < 200:
-                print("[courtlistener] low content length for chosen result; attempting web fallback")
-                web_hits = self.search_web_paragraph(q, top_k=1)
-                if web_hits:
-                    return web_hits
-            # if query had explicit U.S. citation, require that citation appears in chosen result
-            if cite_match:
-                # prefer exact numeric U.S. reporter match in citation list/text
-                expected_num = str(cite_match.group(1))
-                cit_field = normalize_text(first.get("citation") or "")
-                if expected_num not in cit_field:
-                    print("[courtlistener] chosen result lacks expected citation; trying to find a result with matching citation")
-                    # try to find one in results
-                    for r in results:
-                        cit = normalize_text(r.get("citation") or "")
-                        if f"{cite_match.group(1)} u.s." in cit or str(cite_match.group(1)) in cit:
-                            content = r.get("content") or r.get("plain_text") or ""
-                            return [ {
-                                "query": q,
-                                "backend": "courtlistener",
-                                "id": r.get("id"),
-                                "source": r.get("url"),
-                                "title": r.get("case_name") or r.get("title"),
-                                "citation": r.get("citation"),
-                                "content": content,
-                                "retrieved_at": r.get("retrieved_at"),
-                            } ]
-                    # fallback to web if no matching citation in results
-                    web_hits = self.search_web_paragraph(q, top_k=1)
-                    if web_hits:
-                        return web_hits
 
         return out
 
