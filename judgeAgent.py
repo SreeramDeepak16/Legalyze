@@ -62,10 +62,11 @@ def get_domain_type(url: Optional[str]) -> str:
 
 
 def extract_years_and_dates(text: str) -> Dict[str, Optional[int]]:
-    years = [int(y) for y in re.findall(r"\b(19|20)\d{2}\b", text)]
+    # fixed: use non-capturing group so full year strings are returned (avoid truncated years)
+    years = [int(y) for y in re.findall(r"\b(?:19|20)\d{2}\b", text)]
     earliest = min(years) if years else None
     latest = max(years) if years else None
-    iso_dates = bool(re.search(r"\b(19|20)\d{2}-\d{2}-\d{2}\b", text))
+    iso_dates = bool(re.search(r"\b(?:19|20)\d{2}-\d{2}-\d{2}\b", text))
     return {"earliest_year": earliest, "latest_year": latest, "has_iso_date": iso_dates}
 
 
@@ -92,19 +93,33 @@ def detect_jurisdictions(text: str, url: Optional[str]) -> List[str]:
 
 
 def contradiction_scan(text: str) -> Dict[str, Any]:
+    """
+    Less-sensitive contradiction scan:
+      - skip sentences that are explicitly historical/descriptive (amend/adopt/withdraw etc.)
+      - require at least 3 meaningful shared tokens and opposing polarity to flag contradiction
+    """
     sents = [s.strip() for s in re.split(r'[.\n]+', text) if s.strip()]
     assertions = []
+    HISTORICAL_KEYWORDS = {
+        "revise", "revised", "revision", "amend", "amended", "amendments",
+        "adopt", "adopted", "withdraw", "withdrawn", "not adopted", "not adopted"
+    }
     for s in sents:
         if re.search(r"\b(is|are|shall|must|prohib|allow|permits|forbid|not|no|never|except|unless)\b", s, re.I):
+            low = s.lower()
+            # skip sentences that are primarily historical/descriptive
+            if any(k in low for k in HISTORICAL_KEYWORDS):
+                continue
             assertions.append(s)
     contradictions = []
-    STOP = {"the", "a", "an", "and", "or", "of", "to", "in", "on", "with", "for", "by", "that"}
+    STOP = {"the", "a", "an", "and", "or", "of", "to", "in", "on", "with", "for", "by", "that", "this", "these"}
     lowered = [re.sub(r'[^a-z0-9\s]', '', a.lower()) for a in assertions]
     tokenized = [set([w for w in a.split() if w and w not in STOP]) for a in lowered]
     for i in range(len(assertions)):
         for j in range(i + 1, len(assertions)):
             common = tokenized[i].intersection(tokenized[j])
-            if len(common) >= 2:
+            # require >=3 shared meaningful tokens to reduce false positives
+            if len(common) >= 3:
                 neg_i = bool(re.search(r"\b(not|no|never|except|unless)\b", assertions[i], re.I))
                 neg_j = bool(re.search(r"\b(not|no|never|except|unless)\b", assertions[j], re.I))
                 if neg_i != neg_j:
@@ -374,70 +389,136 @@ Return ONLY JSON in this format (valid JSON):
                 missing_information=["LLM_parsing_failed"],
                 suggested_refinements=[]
             )
-            self.memory.save({"audit": audit_entry, "final": final_jr.dict()})
+            # save audit and final (include gating flag)
+            try:
+                self.memory.save({"audit": audit_entry, "final": final_jr.dict(), "deterministic_require_citation": bool(canonical)})
+            except Exception:
+                self.memory.save({"audit": audit_entry, "final": {"is_sufficient": final_jr.is_sufficient, "reasoning": final_jr.reasoning}, "deterministic_require_citation": bool(canonical)})
             return {"parsed_judge": final_jr, "raw_llm": raw_text}
 
         # At this point we have a parsed JudgeResult from LLM
         jr: JudgeResult = parsed  # type: ignore
 
-        # Option A strict gating:
-        # Conditions required for final is_sufficient = True:
-        #  1) canonical citation exists in query AND citation_present True
-        #  2) authoritative_exists True
-        #  3) jr.is_sufficient is True (LLM agrees) AND jr.missing_information is empty
-        #  4) title_match or citation_present (basic content agreement)
-        reasons: List[str] = []
-        passed = True
+        # Build features for a scored decision (less brittle than a single LLM gate)
+        require_citation = bool(canonical)
 
-        if not canonical:
-            reasons.append("Query does not contain a canonical reporter citation (e.g., '514 U.S. 549').")
-            passed = False
-        else:
+        # Per-result contradiction check (aggregate across returned results)
+        no_contradiction = True
+        for r in results:
+            try:
+                cs = r.metadata.get("contradiction_scan", {})
+                if cs and cs.get("has_contradiction"):
+                    no_contradiction = False
+                    break
+            except Exception:
+                # if metadata malformed, be conservative and assume potential contradiction
+                no_contradiction = False
+                break
+
+        # determine whether missing items are "minor"
+        MINOR_MISSINGS = ["definition", "define", "overview", "purpose", "how is", "adopt", "adoption", "one-sentence", "single-sentence"]
+        missing_items = [str(m).lower() for m in jr.missing_information or []]
+        minor_only_missing = len(missing_items) > 0 and all(any(k in m for k in MINOR_MISSINGS) for m in missing_items)
+
+        # treat missing-info as partial credit rather than hard fail
+        no_missing_info = len(jr.missing_information) == 0
+
+        # Scoring weights (adjusted)
+        score = 0
+        if authoritative_exists:
+            score += 45   # bigger weight for authority
+        if title_match:
+            score += 20
+        if citation_present:
+            score += 20
+        if no_missing_info:
+            score += 15
+        elif minor_only_missing:
+            score += 8   # some credit if only minor formatting/definition items missing
+        if no_contradiction:
+            score += 22
+
+        max_possible = 45 + 20 + 20 + 15 + 22  # =122
+        score_pct = int((score / max_possible) * 100) if max_possible > 0 else 0
+
+        # Decision thresholds:
+        # - If the query asked for a canonical reporter citation, be strict:
+        #     require citation_present OR score_pct >= 85
+        # - Otherwise (topical queries), accept if score_pct >= 55 (loosened)
+        passed = False
+        deterministic_reasons: List[str] = []
+
+        if require_citation:
             if not citation_present:
-                reasons.append(f"Canonical citation '{canonical}' from query not found in any result.")
-                passed = False
+                deterministic_reasons.append(f"Canonical citation '{canonical}' from query not found in any result.")
+            if score_pct >= 85 or (citation_present and authoritative_exists and no_contradiction):
+                passed = True
+        else:
+            # topical query path
+            # if the LLM says sufficient and there are no contradictions and authoritative result exists -> accept
+            if jr.is_sufficient and authoritative_exists and no_contradiction:
+                passed = True
+            else:
+                # fallback to score threshold
+                if score_pct >= 55:
+                    passed = True
+                else:
+                    deterministic_reasons.append(f"Aggregate score too low: {score_pct}% (needs >=55 for topical queries).")
 
-        if not authoritative_exists:
-            reasons.append("No authoritative result found (gov/edu/court_decision).")
-            passed = False
-
+        # Always include the LLM's judgments as part of the reasoning details
         if not jr.is_sufficient:
-            reasons.append("LLM judged results as not sufficient.")
-            passed = False
-
+            deterministic_reasons.append("LLM judged results as not sufficient.")
         if jr.missing_information:
-            reasons.append(f"LLM reported missing information: {jr.missing_information}")
-            passed = False
+            deterministic_reasons.append(f"LLM reported missing information: {jr.missing_information}")
+        if not authoritative_exists:
+            deterministic_reasons.append("No authoritative result found (gov/edu/court_decision).")
+        if not no_contradiction:
+            deterministic_reasons.append("Contradictions detected in retrieved content.")
 
-        if not (title_match or citation_present):
-            reasons.append("No clear title/citation match between query and results.")
-            passed = False
-
-        # If any check failed, final result is insufficient; augment reasoning to be explicit
+        # Build final_jr consistent with previous code shape
         if passed:
             final_jr = jr
             final_jr.is_sufficient = True
-            final_jr.reasoning = (final_jr.reasoning or "") + " (Accepted by deterministic Option A checks: citation present, authoritative source, title/citation match.)"
+            final_jr.reasoning = (final_jr.reasoning or "") + (
+                f" (Accepted by scored deterministic checks: score_pct={score_pct}, "
+                f"authoritative={authoritative_exists}, title_match={title_match}, citation_present={citation_present}.)"
+            )
         else:
-            # Build a deterministic reasoning augmentation
-            augment = " | Deterministic checks failed: " + " ; ".join(reasons)
             final_jr = jr
             final_jr.is_sufficient = False
+            augment = " | Deterministic checks failed: " + " ; ".join(deterministic_reasons)
             final_jr.reasoning = (final_jr.reasoning or "") + augment
-            # ensure missing_information mentions deterministic failures for visibility
-            for r in reasons:
+            # ensure missing_information includes deterministic reasons
+            for r in deterministic_reasons:
                 if r not in final_jr.missing_information:
                     final_jr.missing_information.append(r)
 
-        # Save both raw and final_jr to memory for auditing
+        # Save both raw and final_jr to memory for auditing, include which gating path and score
         try:
-            self.memory.save({"audit": audit_entry, "final": final_jr.dict()})
+            self.memory.save({
+                "audit": audit_entry,
+                "final": final_jr.dict(),
+                "deterministic_require_citation": require_citation,
+                "deterministic_score_pct": score_pct,
+                "deterministic_reasons": deterministic_reasons,
+            })
         except Exception:
-            # pydantic v2 compatibility
             try:
-                self.memory.save({"audit": audit_entry, "final": final_jr.model_dump()})
+                self.memory.save({
+                    "audit": audit_entry,
+                    "final": final_jr.model_dump(),
+                    "deterministic_require_citation": require_citation,
+                    "deterministic_score_pct": score_pct,
+                    "deterministic_reasons": deterministic_reasons,
+                })
             except Exception:
-                self.memory.save({"audit": audit_entry, "final": {"is_sufficient": final_jr.is_sufficient, "reasoning": final_jr.reasoning}})
+                self.memory.save({
+                    "audit": audit_entry,
+                    "final": {"is_sufficient": final_jr.is_sufficient, "reasoning": final_jr.reasoning},
+                    "deterministic_require_citation": require_citation,
+                    "deterministic_score_pct": score_pct,
+                    "deterministic_reasons": deterministic_reasons,
+                })
 
         return {"parsed_judge": final_jr, "raw_llm": raw_text}
 
@@ -601,46 +682,3 @@ class EvaluateAgent:
             "results_objects": self.results,
             "memory": self.memory.memory,
         }
-
-
-# Entrypoint
-if __name__ == "__main__":
-    import argparse
-    import sys
-
-    parser = argparse.ArgumentParser(description="Run Judge evaluation for a query")
-    parser.add_argument("query", nargs="?", default=None, help="Query text to search and judge")
-    parser.add_argument("--key-env", default="JUDGE_KEY", help="Environment variable containing the Judge API key")
-    args = parser.parse_args()
-
-    query = args.query
-    if not query:
-        if not sys.stdin.isatty():
-            query = sys.stdin.read().strip()
-        else:
-            try:
-                query = input("Enter query (or paste the search term): ").strip()
-            except EOFError:
-                print("No query provided and unable to read from input.")
-                raise SystemExit(2)
-
-    if not query:
-        print("No query provided.")
-        raise SystemExit(2)
-
-    api_key = os.getenv(args.key_env)
-    if not api_key:
-        print(f"Environment variable {args.key_env} not found. Please set it before running.")
-        raise SystemExit(2)
-
-    try:
-        agent = EvaluateAgent(query, judge_key_env=args.key_env)
-        out = agent.run()
-        print(json.dumps({
-            "is_sufficient": out["is_sufficient"],
-            "reasoning": out["reasoning"],
-            "memory_len": len(out["memory"]),
-        }, indent=2))
-    except Exception:
-        print("Failed to run EvaluateAgent, exception trace:")
-        traceback.print_exc()
