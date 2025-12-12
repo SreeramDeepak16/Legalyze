@@ -2,7 +2,6 @@
 from dotenv import load_dotenv
 load_dotenv()
 
-from mirix_interface import MirixMemoryStub
 from searchAgent import SearchAgent
 
 # choose a query that matches the jurisdiction you want:
@@ -11,11 +10,11 @@ from searchAgent import SearchAgent
 # QUERY = "How does judicial review work in the U.S.?"
 
 def run_all(Query):
-    mirix = MirixMemoryStub()
-    agent = SearchAgent(mirix_client=mirix)
+
+    agent = SearchAgent()
 
     # 1) Mirix
-    mirix_hits = agent.search_mirix_paragraph(Query, top_k=3) # type: ignore
+    # mirix_hits = agent.search_mirix_paragraph(Query, top_k=3) # type: ignore
     # print("\n=== Mirix Results ===")
     # if not mirix_hits:
     #     print("No mirix hits")
@@ -48,7 +47,11 @@ def run_all(Query):
     
     result = []
     # result.append(mirix_hits)
-    result.append(cl_hits)
+    if cl_hits != []:
+        result.append(cl_hits)
+
     result.append(web_hits)
     return result
 
+
+# print(run_all("What are the laws about guns in texas"))
