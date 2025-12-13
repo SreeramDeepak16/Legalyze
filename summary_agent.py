@@ -5,6 +5,9 @@ from urllib.parse import urlparse
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.language_models import BaseChatModel
 from langchain_google_genai import ChatGoogleGenerativeAI
+import os
+from dotenv import load_dotenv
+load_dotenv()
 
 
 def _flatten_results(results_field: Any) -> List[Dict[str, Any]]:
@@ -58,7 +61,7 @@ class SummaryAgent:
     def __init__(self, llm: Optional[BaseChatModel] = None) -> None:
         self.llm = llm or ChatGoogleGenerativeAI(
             model="gemini-2.5-flash",
-            temperature=0,
+            google_api_key=os.getenv("SUMMARY_KEY")
         )
 
         # Prompt used when the judge says information is sufficient
@@ -69,8 +72,9 @@ class SummaryAgent:
                     (
                         "You are a concise, careful legal assistant. "
                         "Use ONLY the VERIFIED SOURCES provided to answer the question. "
+                        "Talk in the tone that you have looked for the sources and not like they were externally provided to you."
                         "Do not invent facts or speculate beyond the sources. "
-                        "Provide a medium-length answer: not too short, not excessively long "
+                        "Provide a long answer mentioning everything required to answer the question."
                         "(for example, aim for a few well-structured paragraphs that cover all "
                         "important points needed to answer the question)."
                     ),
@@ -98,6 +102,7 @@ class SummaryAgent:
                     (
                         "You are a careful legal assistant. The available sources are not "
                         "sufficient to fully and reliably answer the question.\n"
+                        "Talk in the tone that you have looked for the sources and not like they were externally provided to you."
                         "Your job is to:\n"
                         "1) Honestly state that the available information is not sufficient "
                         "to fully answer the question, and\n"
@@ -114,7 +119,8 @@ class SummaryAgent:
                         "Instructions:\n"
                         "- Start by clearly stating that there is not enough information in these "
                         "sources to fully answer the QUESTION.\n"
-                        "- Then, provide a concise summary of the key points and facts that "
+                        "- Then, ONLY IF the sources contain RELEVANT information to the question, "
+                        "provide a concise summary of the key points and facts that "
                         "the sources DO contain which are relevant to the QUESTION.\n"
                     ),
                 ),
@@ -127,6 +133,8 @@ class SummaryAgent:
         question: str = None,
         max_sources: int = 8,
     ) -> str:
+        print("*****************output from judge****************")
+        #print(judge_output.get("results")[0][0][200])
         # If question is not explicitly provided, try to recover it from judge_output
         if question is None:
             try:
