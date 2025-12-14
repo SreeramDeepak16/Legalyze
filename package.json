@@ -1,0 +1,21 @@
+{
+  "name": "legalyze-app",
+  "version": "1.0.0",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "devDependencies": {
+    "electron": "^39.2.4"
+  },
+  "dependencies": {
+    "find-process": "^2.0.0",
+    "highlight.js": "^11.11.1",
+    "marked": "^17.0.1"
+  }
+}

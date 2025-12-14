@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="utf-8" />
+    <title>Legalyze</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github-dark.min.css">
+</head>
+
+<body>
+    <div id="app">
+        <div id="header">Legalyze</div>
+        <div id="chatBox" role="log" aria-live="polite"></div>
+
+        <div id="inputBar">
+            <input type="file" id="fileInput" multiple style="display:none" />
+            <button id="attachBtn">📎</button>
+        
+            <textarea id="messageInput" placeholder="Type your message…" rows="1" autocomplete="off"></textarea>
+            <button id="sendBtn" title="Send">➤</button>
+        </div>
+    </div>
+
+    <script type="module" src="renderer.js"></script>
+</body>
+
+</html>
