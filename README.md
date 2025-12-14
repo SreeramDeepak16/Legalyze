@@ -80,8 +80,6 @@ Future Enhancements:<br>
 2. User controlled memory deletion & updates<br>
 3. Jurisdiction-specific legal reasoning<br>
 4. Fine-grained memory confidence scoring<br>
-5. User-controlled memory management<br>
-6. Cloud-based multi-user support<br>
 
 
 Conclusion<br>
